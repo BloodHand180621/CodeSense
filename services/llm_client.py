@@ -1066,7 +1066,9 @@ class SharedLLMClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        response = self.chat(messages, temperature=0.2)
+        response = self.chat(
+            messages, temperature=0.2, request_kind="submission"
+        )
         if not response:
             return 3, "LLM 响应失败，使用默认评分"
 

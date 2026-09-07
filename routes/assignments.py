@@ -83,8 +83,18 @@ def generate_assignment():
                 {"role": "user", "content": f"请针对这个主题生成一道编程题：{prompt}"}
             ]
             if stream:
-                return client.chat_stream(messages, temperature=0.7, max_tokens=1200)
-            return client.chat(messages, temperature=0.7, max_tokens=1200)
+                return client.chat_stream(
+                    messages,
+                    temperature=0.7,
+                    max_tokens=1200,
+                    request_kind="batch",
+                )
+            return client.chat(
+                messages,
+                temperature=0.7,
+                max_tokens=1200,
+                request_kind="batch",
+            )
 
         def parse_result(result_content):
             if "```json" in result_content:
@@ -804,7 +814,9 @@ def student_assignments():
                         {"role": "user", "content": user_prompt}
                     ]
                     
-                    response = llm_client.chat(messages, temperature=0.2)
+                    response = llm_client.chat(
+                        messages, temperature=0.2, request_kind="interactive"
+                    )
                     if response:
                         clean_res = response.strip()
                         if "```json" in clean_res:

@@ -1615,7 +1615,12 @@ def stt_optimize():
                 })
                 chunks = []
                 try:
-                    for chunk in client.chat_stream(messages, temperature=0.2, max_tokens=300):
+                    for chunk in client.chat_stream(
+                        messages,
+                        temperature=0.2,
+                        max_tokens=300,
+                        request_kind="stt",
+                    ):
                         if not chunk:
                             continue
                         value = str(chunk)
@@ -1641,7 +1646,9 @@ def stt_optimize():
 
             return sse_response(stream_optimized_text())
         
-        optimized_text = client.chat(messages, temperature=0.2, max_tokens=300)
+        optimized_text = client.chat(
+            messages, temperature=0.2, max_tokens=300, request_kind="stt"
+        )
         if optimized_text:
             optimized_text = optimized_text.strip()
             # 移除可能的多余包围引号
@@ -1725,7 +1732,9 @@ def stt_transcribe():
             {"role": "user", "content": f"请优化以下语音识别文本：\n{raw_text}"}
         ]
         
-        optimized_text = client.chat(messages, temperature=0.2, max_tokens=300)
+        optimized_text = client.chat(
+            messages, temperature=0.2, max_tokens=300, request_kind="stt"
+        )
         if optimized_text:
             optimized_text = optimized_text.strip()
             if optimized_text.startswith('"') and optimized_text.endswith('"'):
@@ -2357,7 +2366,7 @@ def _lazy_backfill_summary(preset: AssignmentThinkingPreset):
     response = client.chat(
         [{"role": "system", "content": "你是数据结构课程教师，善于用简洁的自然语言总结算法流程。"},
          {"role": "user", "content": prompt}],
-        temperature=0.3, max_tokens=600
+        temperature=0.3, max_tokens=600, request_kind="background"
     )
     if response and response.strip():
         preset.algorithm_summary = response.strip()

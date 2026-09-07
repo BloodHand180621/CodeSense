@@ -128,11 +128,7 @@ class StructuredDecisionModel:
 
         messages = self._decision_messages(system_prompt, context, tool_specs, tool_results)
         try:
-            response = self.client.chat(
-                messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            response = self._chat_with_trace_kind(messages)
             return parse_json_decision(response)
         except ModelError as error:
             if error.code not in _REPAIRABLE_ERRORS:
@@ -151,16 +147,35 @@ class StructuredDecisionModel:
             ),
         })
         try:
-            response = self.client.chat(
-                repair_messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            response = self._chat_with_trace_kind(repair_messages)
             return parse_json_decision(response)
         except ModelError:
             return self._fallback("INVALID_DECISION")
         except Exception:
             return self._fallback("CLIENT_ERROR")
+
+    def _chat_with_trace_kind(self, messages: List[Dict[str, str]]):
+        """Keep injected legacy clients usable while labeling real calls."""
+        try:
+            return self.client.chat(
+                messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                request_kind="stage3",
+            )
+        except TypeError as error:
+            # Tests and integrations may inject an older client whose method
+            # predates the optional trace keyword.  A Python signature error
+            # happens before the provider call, so this fallback cannot replay
+            # a partially completed model request.
+            if "unexpected keyword argument 'request_kind'" not in str(error):
+                raise
+            legacy_chat = self.client.chat
+            return legacy_chat(
+                messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
 
     def _is_available(self) -> bool:
         try:

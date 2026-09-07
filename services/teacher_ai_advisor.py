@@ -222,7 +222,12 @@ def generate_class_suggestions(class_id, teacher_id, demo_run_id=None):
                     }
                 ]
 
-                response = llm.chat(messages, temperature=0.7, max_tokens=2500)
+                response = llm.chat(
+                    messages,
+                    temperature=0.7,
+                    max_tokens=2500,
+                    request_kind="background",
+                )
                 if response:
                     parts = response.split('===JSON===')
                     markdown_part = parts[0].strip()
@@ -529,7 +534,7 @@ def generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None):
             json_started = False
             has_sent_start = False
             
-            for chunk in llm.chat_stream(messages):
+            for chunk in llm.chat_stream(messages, request_kind="background"):
                 full_text += chunk
                 if "===" in chunk or "JSON" in chunk or json_started:
                     json_started = True

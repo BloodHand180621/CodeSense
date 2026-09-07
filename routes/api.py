@@ -917,6 +917,7 @@ def get_code_advice():
                             messages,
                             temperature=0.7,
                             max_tokens=1000,
+                            request_kind="code_advice",
                         ):
                             if content:
                                 chunks.append(content)

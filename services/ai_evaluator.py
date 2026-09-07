@@ -54,6 +54,7 @@ class AIEvaluator:
                 max_tokens=1000,
                 provider="zhipu",
                 model="glm-4.5-flash",
+                request_kind="submission",
             )
             if content:
                 return json.loads(content)
@@ -151,6 +152,7 @@ class AIEvaluator:
                 temperature=0.4,
                 max_tokens=3000,
                 provider="zhipu",
+                request_kind="batch",
             ):
                 if chunk:
                     yield chunk
@@ -202,6 +204,7 @@ class AIEvaluator:
                 temperature=0.7,
                 max_tokens=2000,
                 provider="zhipu",
+                request_kind="ability_analysis",
             )
             if not result_content or not result_content.strip():
                 raise RuntimeError("AI服务未返回有效内容")
@@ -369,6 +372,7 @@ class AIEvaluator:
                 temperature=0.7,
                 max_tokens=2000,
                 provider="zhipu",
+                request_kind="ability_analysis",
             ):
                 if content:
                     yield content
@@ -412,6 +416,7 @@ dynamic_memory, linked_list, tree, sorting, searching, recursion
                 temperature=0.3,
                 max_tokens=500,
                 provider="zhipu",
+                request_kind="submission",
             )
             if not content:
                 return []
