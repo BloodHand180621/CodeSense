@@ -432,7 +432,7 @@ PR #16 合并后，评审人留下一项 P3 文档改进意见（不阻塞合并
 - §9：新增“启用 RQ 后 demo 代码执行与残留任务在 Web 主机的隔离安排”未知项；
 - §10：结论补充 RQ 迁出范围限定。
 
-第二轮 PR 链接：<!-- PR2_LINK_PLACEHOLDER -->（手动推送并创建 PR 后回填）。
+第二轮 PR 链接：https://github.com/XiaoCow666/CodeSense/pull/22（分支 `docs/project-understanding-rq-scope`，基于 PR #16 合并后的最新 main，doc-only，1 个提交）。
 
 ### 11.2 与上一轮尝试的关系
 
