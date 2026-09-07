@@ -23,6 +23,7 @@ from services.teacher_analytics import build_teacher_dashboard_data
 from services.demo_database import current_demo_run_id
 from utils.auth import admin_required
 from utils.maturity_calculator import calculate_maturity_components
+from utils.timezone import format_display_datetime
 
 main = Blueprint('main', __name__)
 
@@ -623,18 +624,9 @@ def teacher_ai_suggestions():
     class_suggestions = []
     for cls in managed_classes:
         sug = TeacherAISuggestion.query.filter_by(class_id=cls.id).first()
-        # 如果不存在建议，或者建议为pending，我们可以自动触发首次生成
+        # 首次生成由页面的 SSE 唯一路径负责，避免后台任务与 SSE 并发写同一条记录。
         if not sug:
             sug = TeacherAISuggestion.get_or_create(class_id=cls.id, teacher_id=teacher.student_id)
-            # 异步触发生成
-            from services.teacher_ai_advisor import generate_class_suggestions_async
-            from flask import current_app
-            generate_class_suggestions_async(
-                cls.id,
-                teacher.student_id,
-                current_app._get_current_object(),
-                demo_run_id=current_demo_run_id(),
-            )
             
         class_suggestions.append({
             'class': cls,
@@ -700,7 +692,7 @@ def api_teacher_suggestion_status(class_id):
 
     return jsonify({
         'status': sug.status,
-        'last_updated': sug.last_updated.strftime('%Y-%m-%d %H:%M:%S') if sug.last_updated else None,
+        'last_updated': format_display_datetime(sug.last_updated) if sug.last_updated else None,
         'suggestion_markdown': sug.suggestion_markdown,
         'suggestion_json': sug.get_suggestion_dict()
     })

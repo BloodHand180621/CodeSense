@@ -1,10 +1,15 @@
 import json
+import logging
 import threading
 from datetime import datetime as dt
 from models import db, User, Class, KnowledgePointScore, Assignment, AssignmentKnowledgePoint, TeacherAISuggestion
 from services.teacher_analytics import build_class_learning_rows
 from services.llm_client import SharedLLMClient
 from services.demo_database import activate_demo_run, is_active_demo_run
+from utils.timezone import format_display_datetime
+
+
+logger = logging.getLogger(__name__)
 
 # 线程锁，防止重复并发生成同一班级的AI建议
 _generation_locks = {}
@@ -34,6 +39,26 @@ def _mark_demo_suggestion_failed(class_id, teacher_id):
     suggestion.last_updated = dt.utcnow()
     db.session.commit()
     return suggestion
+
+
+def _mark_stream_failed_if_needed(class_id, teacher_id, suggestion, demo_run_id):
+    """Do not leave a suggestion permanently stuck in ``processing``."""
+
+    try:
+        if suggestion is None or suggestion.status != 'processing':
+            return
+        if demo_run_id:
+            if _demo_database_is_available(demo_run_id):
+                _mark_demo_suggestion_failed(class_id, teacher_id)
+            return
+        suggestion.status = 'failed'
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "教师端学情流失败状态清理异常 class_id=%s",
+            class_id,
+        )
 
 
 def generate_class_suggestions(class_id, teacher_id, demo_run_id=None):
@@ -352,6 +377,41 @@ def generate_class_suggestions_async(class_id, teacher_id, app, demo_run_id=None
 
 
 def generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None):
+    """Wrap the stream so disconnects/errors are logged and finalized."""
+
+    state = {}
+    try:
+        yield from _generate_class_suggestions_stream(
+            class_id,
+            teacher_id,
+            demo_run_id=demo_run_id,
+            state=state,
+        )
+    except GeneratorExit:
+        _mark_stream_failed_if_needed(
+            class_id,
+            teacher_id,
+            state.get('suggestion'),
+            demo_run_id,
+        )
+        logger.info("教师端学情 SSE 客户端断开 class_id=%s", class_id)
+        raise
+    except Exception as exc:
+        _mark_stream_failed_if_needed(
+            class_id,
+            teacher_id,
+            state.get('suggestion'),
+            demo_run_id,
+        )
+        logger.exception(
+            "教师端学情 SSE 异常 class_id=%s error_type=%s",
+            class_id,
+            type(exc).__name__,
+        )
+        yield f"data: {json.dumps({'type': 'error', 'message': '流式生成 AI 建议失败，请刷新重试'})}\n\n"
+
+
+def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *, state=None):
     """
     流式生成班级学情建议，计算规则引擎结果，并流式输出LLM反馈报告，最后保存入库
     """
@@ -367,6 +427,8 @@ def generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None):
         return
 
     suggestion = TeacherAISuggestion.get_or_create(class_id=class_id, teacher_id=teacher_id)
+    if state is not None:
+        state['suggestion'] = suggestion
     suggestion.status = 'processing'
     db.session.commit()
 
@@ -566,13 +628,17 @@ def generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None):
                     suggestion.last_updated = dt.utcnow()
                     db.session.commit()
                     
-                    yield f"data: {json.dumps({'type': 'complete', 'suggestion_json': parsed_json, 'last_updated': suggestion.last_updated.strftime('%Y-%m-%d %H:%M:%S')})}\n\n"
+                    yield f"data: {json.dumps({'type': 'complete', 'suggestion_json': parsed_json, 'last_updated': format_display_datetime(suggestion.last_updated)})}\n\n"
                     return
             except Exception as je:
-                print(f"LLM JSON 流解析失败: {je}")
+                logger.warning(
+                    "教师端学情 JSON 流解析失败 class_id=%s error_type=%s",
+                    class_id,
+                    type(je).__name__,
+                )
 
         except Exception as le:
-            print(f"LLM 流式分析失败: {le}")
+            logger.exception("教师端学情 LLM 流式分析失败 class_id=%s", class_id)
 
         if demo_run_id:
             if _demo_database_is_available(demo_run_id):
@@ -601,5 +667,5 @@ def generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None):
     suggestion.last_updated = dt.utcnow()
     db.session.commit()
 
-    yield f"data: {json.dumps({'type': 'complete', 'suggestion_json': rule_json_dict, 'last_updated': suggestion.last_updated.strftime('%Y-%m-%d %H:%M:%S')})}\n\n"
+    yield f"data: {json.dumps({'type': 'complete', 'suggestion_json': rule_json_dict, 'last_updated': format_display_datetime(suggestion.last_updated)})}\n\n"
 

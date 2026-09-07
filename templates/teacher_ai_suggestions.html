@@ -221,7 +221,7 @@
                                 {% if sug.status == 'completed' %}已生成{% elif sug.status == 'processing' %}分析中{% elif sug.status == 'failed' %}生成失败{% else %}待生成{% endif %}
                             </span>
                             <span class="text-muted">
-                                最近更新：{{ sug.last_updated.strftime('%Y-%m-%d %H:%M:%S') if sug.last_updated else '尚未更新' }}
+                                最近更新：{{ sug.last_updated|localtime('%Y-%m-%d %H:%M:%S') if sug.last_updated else '尚未更新' }}
                             </span>
                         </div>
 
@@ -325,7 +325,7 @@
                                                 {% endif %}
                                             </div>
                                             <div class="text-end mt-2">
-                                                <span class="text-muted small"><i class="bi bi-clock me-1"></i>上次更新: <span class="update-time-{{ cls.id }}">{{ sug.last_updated.strftime('%Y-%m-%d %H:%M:%S') if sug.last_updated else '无' }}</span></span>
+                                                <span class="text-muted small"><i class="bi bi-clock me-1"></i>上次更新: <span class="update-time-{{ cls.id }}">{{ sug.last_updated|localtime('%Y-%m-%d %H:%M:%S') if sug.last_updated else '无' }}</span></span>
                                             </div>
                                         </div>
                                     </div>

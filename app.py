@@ -38,6 +38,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config import config
 from models import db, init_db
 from services.api_keys import api_keys  # 导入 API 密钥管理器
+from utils.timezone import format_display_datetime
 
 
 def _env_bool(name, default=False):
@@ -453,6 +454,11 @@ def create_app(config_name='default'):
             return _json.loads(s) if s else []
         except Exception:
             return []
+
+    @app.template_filter('localtime')
+    def localtime_filter(value, fmt='%Y-%m-%d %H:%M:%S'):
+        """Render a stored UTC timestamp in the configured display timezone."""
+        return format_display_datetime(value, fmt)
 
     # 注册全局上下文变量
     @app.context_processor
