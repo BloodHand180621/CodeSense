@@ -33,7 +33,15 @@
 
 CodeSense 是一个以 Flask 单体应用为核心的高校编程教学平台：学生提交 C++ 作业后，系统进行受限编译运行、AI 反馈和学习记录；学生还可以通过“思路描述 → 步骤组装 → 费曼教学”的三阶段流程完成引导式练习；教师通过作业、班级、花名册、提交记录和能力分析页面观察学习情况。
 
-它目前不是拆分后的微服务系统，而是“Flask 路由 + SQLAlchemy 模型 + 业务服务 + 异步任务 + 外部数据库/Redis/LLM”的组合。评测和 AI 功能已经有一定容错设计。任务系统存在两种形态（已确认）：**默认配置**下异步任务在 Web 进程内以线程运行，C++ 编译执行也发生在 Web 进程所在主机；代码同时内置了**可选的 RQ 外部队列形态**——`config.py` 暴露队列后端开关，仓库提供独立 worker 进程（`tasks/submission_worker.py`、`tasks/ability_worker.py`）和对应的 systemd 单元，启用后提交评测（含 C++ 编译运行）移出 Web 进程。该形态默认不启用，且即使启用，沙箱仍是应用层 subprocess 而非强隔离。因此部署时最需要优先确认的是：生产采用哪种队列形态、worker 是否独立部署、以及代码执行节点的隔离边界。
+它目前不是拆分后的微服务系统，而是“Flask 路由 + SQLAlchemy 模型 + 业务服务 + 异步任务 + 外部数据库/Redis/LLM”的组合。评测和 AI 功能已经有一定容错设计。任务系统存在两种形态（已确认）：**默认配置**下异步任务在 Web 进程内以线程运行，C++ 编译执行也发生在 Web 进程所在主机；代码同时内置了**可选的 RQ 外部队列形态**——`config.py` 暴露队列后端开关，仓库提供独立 worker 进程（`tasks/submission_worker.py`、`tasks/ability_worker.py`）和对应的 systemd 单元。
+
+但 RQ 的迁出范围是有限的（已确认，评审 P3 修订）：启用 RQ 后，只有**非 demo 的提交评测与对应的能力分析任务**改由独立 worker 进程执行；以下任务**仍在 Web 进程内运行**，不因两个队列开关切换而迁出：
+
+- **公开体验（demo run）的提交评测**：按设计始终走临时库线程路径（见 §6.2、§6.3），其中包含 g++ 编译与运行，即 demo 用户的 C++ 代码执行始终发生在 Web 进程所在主机；
+- **demo 的能力分析**：同样始终走线程路径；
+- **`utils/async_tasks.py` 进程内有界队列**：处理单能力趋势更新（`update_ability_trend`）、批量趋势（`batch_update_trends`）和思维预设生成（`generate_thinking_preset`）三类任务，受 `ASYNC_TASKS_ENABLED` 控制，与 RQ 开关无关；worker 进程启动时会关闭自己的进程内任务，但 Web 进程中的该队列照常运行。
+
+因此启用 RQ 并不等于“所有后台任务和代码执行都迁出 Web 进程”：Web 主机仍承担 demo 代码执行和进程内队列任务。该形态默认不启用，且即使启用，沙箱仍是应用层 subprocess 而非强隔离。部署时最需要优先确认的是：生产采用哪种队列形态、worker 是否独立部署、demo 代码执行是否暴露给公网，以及代码执行节点的隔离边界。
 
 ## 3. 项目概况
 
@@ -221,7 +229,9 @@ python -m tasks.ability_worker
   -> worker 读 CODESENSE_CONFIG（默认 production）并转设 FLASK_CONFIG
   -> 启动时强制关闭进程内任务与预设扫描，避免与 Web 进程重复消费
   -> 仓库提供 codesense-submission-worker.service / codesense-ability-worker.service
-  -> demo 公开体验始终走临时库线程路径，不进入外部队列
+  -> worker 只消费【非 demo】的提交评测与能力分析任务
+  -> demo 公开体验的评测（含 g++ 编译运行）与能力分析始终走 Web 进程线程
+  -> utils/async_tasks.py 进程内队列（批量趋势、思维预设生成等）仍在 Web 进程运行
 ```
 
 部署后应先检查 `/healthz`（不访问数据库的存活检查）和 `/readyz`（执行 `SELECT 1` 的数据库就绪检查）。
@@ -253,6 +263,8 @@ POST /submit/<assignment_id> 或 /api/submit
 
 `routes/assignments.py` 负责页面提交并跳转到评测等待页；`routes/api.py` 提供 API 形式的提交和状态查询。评测任务会把 demo run id 一路传递到后台线程，并在关键写入前再次确认临时库仍然有效。
 
+> 队列形态对本链路的影响（已确认）：`evaluate_submission_async` 仅在「非 demo 且 `SUBMISSION_EVALUATION_QUEUE_BACKEND=rq`」时把评测（含 g++ 编译运行）送入 RQ 由独立 worker 执行；**demo 公开体验的提交评测始终在 Web 进程线程内完成编译与运行**，即使生产启用了 RQ 也不迁出。因此 Web 主机的代码执行隔离要求不因启用 RQ 而对 demo 场景失效。
+
 沙箱当前明确实现了：编译 15 秒超时、单用例运行 5 秒超时、标准输出截断到 4096 字符、换行/行尾空白规范化、临时工作目录和用例级结果。它没有实现操作系统级的权限、网络、文件系统、内存或进程数隔离。
 
 ### 6.4 三阶段引导式学习
@@ -281,9 +293,11 @@ POST /submit/<assignment_id> 或 /api/submit
 
 提交完成后会将 `AbilityTrend` 标记为过期，再由 `tasks/ability_analysis.py` 读取最近提交，调用统一 LLM 客户端生成分析 Markdown；失败时明确记录 failed 状态，不应继续展示陈旧的成功文案。教师首页由 `teacher_analytics.py` 聚合学生活跃度、提交数、作业完成矩阵和风险标签，教师 AI 建议由 `teacher_ai_advisor.py` 异步生成并保存。
 
-`utils/async_tasks.py` 另有一个进程内有界队列，当前支持能力趋势、批量趋势和思维预设生成。它与提交评测/能力分析中的直接线程不是同一个统一任务系统。
+`utils/async_tasks.py` 另有一个进程内有界队列，当前处理三类任务：单能力趋势更新（`update_ability_trend`）、批量趋势（`batch_update_trends`）和思维预设生成（`generate_thinking_preset`）。它与提交评测/能力分析中的直接线程不是同一个统一任务系统，**也不受 RQ 队列开关影响**：即使生产启用 RQ，这三类任务仍在 Web 进程内执行（独立 worker 进程启动时会关闭自己一侧的进程内任务与预设扫描，但 Web 进程中的该队列照常运行）。
 
-> 关于外部队列的可选后端（已确认）：`config.py` 暴露了 `ABILITY_ANALYSIS_QUEUE_BACKEND` 与 `SUBMISSION_EVALUATION_QUEUE_BACKEND` 两个开关，默认 `thread`，可切换为基于 Redis 的外部队列（`ABILITY_ANALYSIS_REDIS_URL`、`SUBMISSION_EVALUATION_REDIS_URL`、对应 `*_QUEUE_NAME`、`*_JOB_TIMEOUT`、`*_QUEUE_TTL`、`*_RESULT_TTL`、`*_FAILURE_TTL`）。`tasks/ability_queue.py` 与 `tasks/submission_queue.py` 负责线程与外部队列之间的分发。Demo run 始终使用临时数据库的线程路径，不走外部队列。外部队列的消费侧是两个独立进程 `tasks/submission_worker.py` 与 `tasks/ability_worker.py`（RQ `Worker`，JSON 序列化），仓库提供对应的 systemd 单元；worker 进程启动时主动关闭进程内任务线程与预设扫描，避免与 Web 进程重复消费。这是当前主线相对早期“纯进程内任务”描述的重要更新；但后端开关默认为 `thread`，不配置 `rq`、不部署 worker 时，系统行为仍与纯进程内形态一致。
+> 关于外部队列的可选后端（已确认）：`config.py` 暴露了 `ABILITY_ANALYSIS_QUEUE_BACKEND` 与 `SUBMISSION_EVALUATION_QUEUE_BACKEND` 两个开关，默认 `thread`，可切换为基于 Redis 的外部队列（`ABILITY_ANALYSIS_REDIS_URL`、`SUBMISSION_EVALUATION_REDIS_URL`、对应 `*_QUEUE_NAME`、`*_JOB_TIMEOUT`、`*_QUEUE_TTL`、`*_RESULT_TTL`、`*_FAILURE_TTL`）。`tasks/ability_queue.py` 与 `tasks/submission_queue.py` 负责线程与外部队列之间的分发。
+>
+> **RQ 的迁出范围（评审 P3 修订）**：外部队列只承接**非 demo 的提交评测与对应能力分析任务**。以下任务不迁出、始终在 Web 进程内运行：① demo run 的提交评测（含 g++ 编译运行）与 demo 能力分析——按设计始终使用临时数据库的线程路径；② `utils/async_tasks.py` 进程内队列的单趋势更新、批量趋势和思维预设生成。外部队列的消费侧是两个独立进程 `tasks/submission_worker.py` 与 `tasks/ability_worker.py`（RQ `Worker`，JSON 序列化），仓库提供对应的 systemd 单元；worker 进程启动时主动关闭自己的进程内任务线程与预设扫描，避免与 Web 进程重复消费。这是当前主线相对早期“纯进程内任务”描述的重要更新；但后端开关默认为 `thread`，不配置 `rq`、不部署 worker 时，系统行为仍与纯进程内形态一致；即使配置了 RQ，上述 ①② 两类任务的进程内风险也不随之降低。
 
 ## 7. 运行方式
 
@@ -319,7 +333,7 @@ python -m pytest tests -q
 4. 配置 Redis 会话/缓存或确认文件会话目录具备隔离、持久化和清理策略；
 5. 安装 `g++`，并为代码执行节点建立额外隔离；
 6. 通过 `gunicorn -c gunicorn_config.py wsgi:application` 启动（或使用 `codesense.service`），再由 Nginx 或其他反向代理对外提供服务；注意 systemd 单元的 `--bind 127.0.0.1:8000` 与配置文件默认 5000 端口径不同，Nginx upstream 需与实际监听端口一致；
-7. 若启用 RQ 外部队列（两个 `*_QUEUE_BACKEND=rq`）：在 `.env` 中补齐 `*_REDIS_URL` 等队列变量（`.env.example` 当前未收录），安装 `rq` 依赖，并独立部署/启用 `codesense-submission-worker.service` 与 `codesense-ability-worker.service`；worker 通过 `CODESENSE_CONFIG` 读取环境名（默认 production）；不启用时保持默认 `thread` 即可，无需 worker 进程；
+7. 若启用 RQ 外部队列（两个 `*_QUEUE_BACKEND=rq`）：在 `.env` 中补齐 `*_REDIS_URL` 等队列变量（`.env.example` 当前未收录），安装 `rq` 依赖，并独立部署/启用 `codesense-submission-worker.service` 与 `codesense-ability-worker.service`；worker 通过 `CODESENSE_CONFIG` 读取环境名（默认 production）；不启用时保持默认 `thread` 即可，无需 worker 进程。**注意 RQ 只迁出非 demo 的提交评测与能力分析**：demo 公开体验的评测（含 g++ 编译运行）仍在 Web 进程线程执行，`utils/async_tasks.py` 的批量趋势与思维预设任务也仍在 Web 进程，Web 主机的隔离与容量评估必须覆盖这部分残留负载；
 8. 持续监控 CPU、内存、数据库连接、任务队列（线程队列深度或 RQ 队列堆积）、AI provider 配额、临时文件和日志磁盘。
 
 ### 7.4 本次接管环境实测记录
@@ -345,8 +359,8 @@ python -m pytest tests -q
 
 | 优先级 | 风险 | 影响 | 当前缓解/后续方向 |
 | --- | --- | --- | --- |
-| 高 | C++ 沙箱是应用层 subprocess 限制，不是强隔离 | 恶意代码可能利用宿主机权限、文件、网络或资源；公网开放存在高风险 | 上线前增加容器/虚拟机、低权限用户、网络禁用、CPU/内存/进程/磁盘配额，并单独部署评测 worker |
-| 高（默认形态）/中（启用 RQ 后） | 后台任务默认在 Web 进程内以线程运行 | 默认 `thread` 后端下，重启可能丢任务；多 worker 各自拥有队列、线程、缓存和去重状态，可能重复执行或任务不可见 | 仓库已内置可选 RQ 持久化队列与独立 worker 进程（含 systemd 单元）：启用两个 `*_QUEUE_BACKEND=rq`、部署 worker 后，评测与能力分析移出 Web 进程，风险显著降低；仍需补充幂等键、重试/死信监控和队列堆积告警。demo 公开体验按设计始终走线程路径 |
+| 高 | C++ 沙箱是应用层 subprocess 限制，不是强隔离 | 恶意代码可能利用宿主机权限、文件、网络或资源；公网开放存在高风险 | 上线前增加容器/虚拟机、低权限用户、网络禁用、CPU/内存/进程/磁盘配额。RQ worker 只能把**非 demo** 提交评测的编译运行迁出 Web 主机；**demo 公开体验的 C++ 编译运行按设计始终在 Web 进程线程内执行**，若 demo 对公网开放，Web 主机仍直接承担不可信代码执行风险，不能因部署了 worker 而视为已隔离 |
+| 高（默认形态）/中（仅迁出任务，启用 RQ 后） | 后台任务默认在 Web 进程内以线程运行 | 默认 `thread` 后端下，重启可能丢任务；多 worker 各自拥有队列、线程、缓存和去重状态，可能重复执行或任务不可见 | 仓库已内置可选 RQ 持久化队列与独立 worker 进程（含 systemd 单元）：启用两个 `*_QUEUE_BACKEND=rq`、部署 worker 后，**仅非 demo 的提交评测与对应能力分析**迁出 Web 进程，这部分任务的重启丢失/重复执行风险显著降低；仍需补充幂等键、重试/死信监控和队列堆积告警。**风险不随 RQ 降级的部分**：① demo 提交评测（含编译运行）与 demo 能力分析始终走 Web 进程线程；② `utils/async_tasks.py` 进程内队列（单趋势更新、批量趋势、思维预设生成）不受 RQ 开关影响，始终在 Web 进程运行 |
 | 高 | AI 输出和 AI 生成预设不是确定性事实 | 评分、提示、能力画像和阶段三判定可能受 provider、提示注入、上下文截断或模型升级影响 | 保留沙箱作为程序事实来源；固定评测协议和模型版本；增加人工复核、敏感数据脱敏、提示注入测试和结果审计 |
 | 高 | 学生代码、对话、代码快照和 AI 结果包含学习隐私 | 数据库、日志、Redis、LLM provider 和导出文件都可能成为数据泄露面 | 明确数据保留/删除策略，限制日志内容和导出权限，生产密钥与数据库分离，核对第三方 AI 数据处理政策 |
 | 中 | 数据库结构演进依赖 `create_all`、补列和索引检查 | 复杂变更、回滚和多版本并行发布缺少清晰迁移轨迹 | 建立版本化迁移、备份/恢复演练和生产前升级验证；不要把启动期自动维护当成完整迁移方案 |
@@ -363,6 +377,7 @@ python -m pytest tests -q
 | --- | --- | --- |
 | 目标生产环境的 Nginx、HTTPS、进程管理和备份拓扑 | 仓库只提供应用侧配置，不能代表真实服务器 | 获取部署清单，验证 forwarded headers、Cookie、超时和优雅退出 |
 | 生产是否启用 RQ 后端、worker 单元是否已部署、Nginx upstream 用 8000 还是 5000 | 队列开关默认 `thread`，`.env.example` 未收录队列变量，systemd 与 gunicorn 配置端口不一致 | 在部署清单中确认两个 `*_QUEUE_BACKEND`、`*_REDIS_URL`、`CODESENSE_CONFIG`、worker 服务启用状态和 Nginx upstream 端口；启用 RQ 后做一次 worker 重启与 Redis 断连演练 |
+| 启用 RQ 后，demo 公开体验的代码执行与 `async_tasks` 残留任务在 Web 主机的隔离安排 | RQ 只迁出非 demo 评测/能力分析；demo 的 g++ 编译运行与进程内队列任务始终在 Web 进程（见 §2、§6.3、§6.5、§8） | 确认 demo 是否对公网开放；若开放，Web 主机本身需按不可信代码执行节点做隔离（容器/低权限/资源配额），不能依赖 worker 部署；监控 Web 进程的线程队列深度与编译负载 |
 | 实际使用的数据库类型、版本、字符集和迁移历史 | 代码同时支持 SQLite/MySQL，历史库结构未随仓库提供 | 对脱敏数据库执行维护命令和升级演练，记录耗时与回滚方案 |
 | AI provider、模型版本、限额和数据留存策略 | 配置可选，provider 行为由外部服务决定 | 建立 provider 配置表、脱敏请求样本、限流/失败演练和成本上限 |
 | C++ 评测是否允许公网用户触发 | 代码提供公开体验和代码执行，但部署访问范围不在仓库内 | 在网络边界文档中明确“课程内受控”还是“公网可用”，并按威胁模型验收沙箱 |
@@ -379,7 +394,7 @@ python -m pytest tests -q
 - 学生主链路由引导式学习、代码提交、C++ 受限执行、AI 反馈和能力分析共同构成；
 - 阶段三已经从单纯文本对话扩展为带事件记忆、工具、覆盖度和完成条件的双 Agent 运行时；
 - 公开体验通过临时数据库和显式 run id 做业务数据隔离；
-- 异步任务存在“进程内线程（默认）”与“RQ 外部队列 + 独立 worker 进程（可选）”两种形态，后者已随代码和 systemd 单元提供，但开关默认 `thread`、不自动启用；
+- 异步任务存在“进程内线程（默认）”与“RQ 外部队列 + 独立 worker 进程（可选）”两种形态，后者已随代码和 systemd 单元提供，但开关默认 `thread`、不自动启用；RQ 仅迁出**非 demo 的提交评测与对应能力分析**，demo 评测（含 C++ 编译运行）与 `utils/async_tasks.py` 进程内队列任务始终留在 Web 进程；
 - 当前小规模课堂/演示是较符合实现边界的使用场景，正式公网部署前必须优先补强沙箱隔离，并明确生产采用哪种队列形态。
 
 ### 本阶段明确不做
@@ -399,8 +414,25 @@ python -m pytest tests -q
 - 目标分支：`main`
 - PR 来源分支：`docs/project-understanding-v2`（账号 `linxi123-A`）
 - 实际推送路径（已确认）：直接推送上游 `XiaoCow666/CodeSense` 返回 HTTP 403（该账号无上游写权限），改为推送到 fork `linxi123-A/CodeSense`，以跨仓库 PR 提交（head：`linxi123-A:docs/project-understanding-v2` → base：`XiaoCow666:main`）
-- PR 链接：https://github.com/XiaoCow666/CodeSense/pull/16
+- PR 链接：https://github.com/XiaoCow666/CodeSense/pull/16（**已合并**，2026-09-06，merge commit `5c2a907`；评审人 XiaoCow666 approved，无阻塞问题）
 - 改动范围：仅新增/更新 `PROJECT_UNDERSTANDING.md` 一个文档文件，不修改业务代码、数据库模型、配置、部署脚本或前端资源。
+
+### 11.1a 合并后评审修订（P3，第二轮文档 PR）
+
+PR #16 合并后，评审人留下一项 P3 文档改进意见（不阻塞合并）：§2、§8 中“启用 RQ 后提交评测（含 C++ 编译运行）移出 Web 进程”的表述缺少适用范围——demo run 始终走临时库线程路径（§6.2、§6.3），且 `utils/async_tasks.py` 进程内队列（批量趋势、思维预设生成）仍在 Web 进程；维护者可能误以为启用两个 RQ 开关即可迁出所有后台任务及代码执行，从而低估 Web 主机的剩余风险。
+
+本轮修订（仍为 doc-only）已按意见将范围表述统一限定为“**非 demo 的提交评测与对应能力分析任务**”，并交叉核对 §2、§5.4、§6.1、§6.3、§6.5、§7.3、§8、§9、§10：
+
+- §2：迁出范围限定 + 明确列出仍在 Web 进程的三类任务（demo 评测含 g++ 编译、demo 能力分析、`async_tasks` 进程内队列）；
+- §6.1：生产路径 worker 注释补充消费范围与残留任务；
+- §6.3：新增队列形态对提交评测链路影响的说明（demo 编译运行不迁出）；
+- §6.5：明确进程内队列三类任务不受 RQ 开关影响，外部队列说明单列迁出范围；
+- §7.3：生产清单第 7 条补充残留负载的隔离与容量提示；
+- §8：沙箱风险行明确 worker 只迁出非 demo 评测、demo 公网开放时 Web 主机仍承担不可信代码执行；任务风险行的降级标注为“仅迁出任务”，并列出风险不降级的两部分；
+- §9：新增“启用 RQ 后 demo 代码执行与残留任务在 Web 主机的隔离安排”未知项；
+- §10：结论补充 RQ 迁出范围限定。
+
+第二轮 PR 链接：https://github.com/XiaoCow666/CodeSense/pull/22（分支 `docs/project-understanding-rq-scope`，基于 PR #16 合并后的最新 main，doc-only，1 个提交）。
 
 ### 11.2 与上一轮尝试的关系
 
