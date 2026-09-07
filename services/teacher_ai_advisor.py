@@ -557,7 +557,7 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
                     "role": "system",
                     "content": (
                         "你是一个专业的编程教育专家，擅长从班级 student 分数、提交活跃度、弱点概念等多维度给出建议。\n"
-                        "请用学术严谨且易懂的中文直接输出分析内容，并在正文结束后，输出一行由 `===JSON===` 分隔的 JSON 字符串，包含系统结构。"
+                        "请用学术严谨且易懂的中文直接输出 Markdown 格式的分析正文。只输出正文，不要输出 JSON、分隔符或额外说明。左侧结构化卡片由系统根据班级数据生成。"
                     )
                 },
                 {
@@ -580,19 +580,7 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
 2. 建议讲解知识点：针对薄弱概念，提供核心讲解策略和典型错误提醒。
 3. 建议补练作业：推荐具体的练习方案。
 
-必须按 Markdown 格式排版正文。
-正文结束后，输出一行 `===JSON===`，紧接着输出以下 JSON 格式的解析字典:
-{{
-  "attention_students": [
-     {{"student_id": "学号", "name": "学生姓名", "risk_reason": "具体风险和建议建议"}}
-  ],
-  "weak_knowledge_points": [
-     {{"point_code": "概念代码", "point_name": "概念名称", "explanation": "掌握现状及对策建议"}}
-  ],
-  "suggested_assignments": [
-     {{"title": "作业标题", "reason": "推荐原因", "difficulty": "中等/困难"}}
-  ]
-}}
+必须按 Markdown 格式排版正文，只输出这份正文。
 """
                 }
             ]
@@ -638,48 +626,69 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
                 visible_chunks += 1
                 yield sse_event({'type': 'delta', 'content': delimiter_tail})
 
-            # 提取 JSON 部分
-            parts = full_text.split('===JSON===')
-            markdown_part = parts[0].strip()
-            json_part = parts[1].strip() if len(parts) > 1 else "{}"
+            # The structured cards are already available from the rule
+            # engine. The streamed model response is deliberately Markdown
+            # only, so malformed/legacy JSON must not turn a visible report
+            # into a failed request. Keep accepting the old delimiter for
+            # cached responses and overlay only valid list fields.
+            parts = full_text.split('===JSON===', 1)
+            markdown_part = parts[0].strip() if len(parts) > 1 else full_text.strip()
+            structured_json = dict(rule_json_dict)
 
-            if json_part.startswith('```'):
-                lines = json_part.splitlines()
-                if lines[0].startswith('```json') or lines[0].startswith('```'):
-                    lines = lines[1:]
-                if lines[-1].startswith('```'):
-                    lines = lines[:-1]
-                json_part = "\n".join(lines).strip()
+            if len(parts) > 1:
+                json_part = parts[1].strip()
+                if json_part.startswith('```'):
+                    lines = json_part.splitlines()
+                    if lines and lines[0].startswith('```'):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith('```'):
+                        lines = lines[:-1]
+                    json_part = "\n".join(lines).strip()
+                try:
+                    parsed_json = json.loads(json_part)
+                    if isinstance(parsed_json, dict):
+                        for key in (
+                            'attention_students',
+                            'weak_knowledge_points',
+                            'suggested_assignments',
+                        ):
+                            if isinstance(parsed_json.get(key), list):
+                                structured_json[key] = parsed_json[key]
+                    else:
+                        raise ValueError('structured response is not an object')
+                except Exception as je:
+                    logger.warning(
+                        "教师端学情结构化尾部无效，使用规则卡片 class_id=%s "
+                        "error_type=%s markdown_chars=%s json_chars=%s",
+                        class_id,
+                        type(je).__name__,
+                        len(markdown_part),
+                        len(json_part),
+                    )
 
-            try:
-                parsed_json = json.loads(json_part)
-                if 'attention_students' in parsed_json and 'weak_knowledge_points' in parsed_json:
-                    suggestion.suggestion_markdown = markdown_part
-                    suggestion.suggestion_json = json.dumps(parsed_json, ensure_ascii=False)
-                    suggestion.status = 'completed'
-                    suggestion.last_updated = dt.utcnow()
-                    db.session.commit()
-                    
-                    yield sse_event({
-                        'type': 'done',
-                        'done': True,
-                        'suggestion_json': parsed_json,
-                        'last_updated': format_display_datetime(suggestion.last_updated),
-                        'stream_metrics': {
-                            'first_visible_ms': round(
-                                (first_visible_at - stream_started_at) * 1000, 2
-                            ) if first_visible_at else None,
-                            'output_chars': len(markdown_part),
-                            'stream_chunks': visible_chunks,
-                        },
-                    })
-                    return
-            except Exception as je:
-                logger.warning(
-                    "教师端学情 JSON 流解析失败 class_id=%s error_type=%s",
-                    class_id,
-                    type(je).__name__,
+            if markdown_part:
+                suggestion.suggestion_markdown = markdown_part
+                suggestion.suggestion_json = json.dumps(
+                    structured_json, ensure_ascii=False
                 )
+                suggestion.status = 'completed'
+                suggestion.last_updated = dt.utcnow()
+                db.session.commit()
+
+                yield sse_event({
+                    'type': 'done',
+                    'done': True,
+                    'suggestion_json': structured_json,
+                    'last_updated': format_display_datetime(suggestion.last_updated),
+                    'stream_metrics': {
+                        'first_visible_ms': round(
+                            (first_visible_at - stream_started_at) * 1000, 2
+                        ) if first_visible_at else None,
+                        'output_chars': len(markdown_part),
+                        'stream_chunks': visible_chunks,
+                    },
+                })
+                return
 
         except Exception as le:
             logger.exception("教师端学情 LLM 流式分析失败 class_id=%s", class_id)

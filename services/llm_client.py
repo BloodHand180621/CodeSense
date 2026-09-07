@@ -439,6 +439,17 @@ class SharedLLMClient:
         self._retry_max_delay = _env_float(
             "AI_RETRY_MAX_DELAY_SECONDS", 8.0, minimum=0.1, maximum=60.0
         )
+        # Provider SDKs default to several minutes of read timeout and their
+        # own hidden retries. That is a poor fit for interactive streaming:
+        # one stalled first token can otherwise occupy a web worker for a
+        # long time before the UI can fall back. Keep one bounded retry policy
+        # in this client instead of stacking SDK and application retries.
+        self._provider_timeout = _env_float(
+            "AI_PROVIDER_TIMEOUT_SECONDS", 30.0, minimum=5.0, maximum=300.0
+        )
+        self._stream_retry_attempts = _env_int(
+            "AI_STREAM_RETRY_ATTEMPTS", 1, minimum=1, maximum=6
+        )
         self._circuit_failure_threshold = _env_int(
             "AI_CIRCUIT_FAILURE_THRESHOLD", 2, minimum=1, maximum=10
         )
@@ -539,6 +550,8 @@ class SharedLLMClient:
             kwargs: Dict[str, Any] = {"api_key": api_keys.zhipu_key}
             if os.environ.get("ZHIPU_BASE_URL"):
                 kwargs["base_url"] = os.environ["ZHIPU_BASE_URL"]
+            kwargs["timeout"] = self._provider_timeout
+            kwargs["max_retries"] = 0
             self._register_provider(
                 LLMProvider.ZHIPU,
                 ZhipuAI(**kwargs),
@@ -559,6 +572,8 @@ class SharedLLMClient:
             kwargs: Dict[str, Any] = {"api_key": api_keys.openai_key}
             if os.environ.get("OPENAI_BASE_URL"):
                 kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+            kwargs["timeout"] = self._provider_timeout
+            kwargs["max_retries"] = 0
             self._register_provider(
                 LLMProvider.OPENAI,
                 OpenAI(**kwargs),
@@ -750,7 +765,14 @@ class SharedLLMClient:
             chunks: List[str] = []
             last_error: Optional[Exception] = None
             requested_model = self._model_for_state(state, model, provider)
-            for attempt in range(self._retry_attempts):
+            # A retry before the first token is useful, but repeating a
+            # provider read timeout three times makes the UI feel hung. The
+            # fallback keeps callers that construct this class without
+            # running __init__ compatible with the legacy retry setting.
+            stream_attempts = getattr(
+                self, "_stream_retry_attempts", self._retry_attempts
+            )
+            for attempt in range(stream_attempts):
                 acquire_started = time.perf_counter()
                 acquired = self._request_semaphore.acquire(timeout=self._request_queue_timeout)
                 queue_wait_seconds = time.perf_counter() - acquire_started

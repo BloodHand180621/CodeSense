@@ -219,6 +219,15 @@ def test_stream_retries_before_first_token(monkeypatch):
     assert len(fake.completions.calls) == 2
 
 
+def test_stream_can_use_a_single_attempt_for_interactive_timeout():
+    fake = FakeProviderClient([TimeoutError("timed out")])
+    client = make_client({LLMProvider.ZHIPU: fake})
+    client._stream_retry_attempts = 1
+
+    assert list(client.chat_stream([{"role": "user", "content": "快速失败"}])) == []
+    assert len(fake.completions.calls) == 1
+
+
 def test_stream_reports_interruption_after_output_without_replaying_prefix():
     class BrokenStream:
         def __iter__(self):

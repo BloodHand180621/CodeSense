@@ -231,7 +231,7 @@
                             <div class="status-container-{{ cls.id }} d-none p-5 text-center">
                                 <div class="spinner-border text-primary fs-3 mb-3 spin" role="status" style="width: 3rem; height: 3rem;"></div>
                                 <h5 class="fw-bold text-slate-800">AI 正在深度分析班级学情...</h5>
-                                <p class="text-muted small">我们正在聚合班级提交详情、评估概念掌握度并生成针对性对策，这可能需要大约 10-30 秒，请稍候。</p>
+                                <p class="text-muted small">正在聚合班级数据并生成针对性对策；首段通常几秒可见，上游响应过慢时会自动切换快速报告。</p>
                             </div>
 
                             <!-- 内容展示区 -->
@@ -492,7 +492,10 @@
                 scheduleRender(true);
                 showTeacherStreamError(classId, data.message || data.error || '系统繁忙');
                 resetRefreshButton(classId, buttonElement);
-                controller.abort();
+                // The server has already emitted a terminal SSE error and
+                // closes the response itself. Aborting here turns a clean
+                // application error into a browser-level incomplete-chunk
+                // error in some Chromium versions.
             },
             onMetrics: metrics => {
                 if (isCurrentStream()) {
@@ -546,7 +549,7 @@
                 <div class="p-4 text-center border rounded-3 bg-light" style="min-height: 400px; display: flex; flex-direction: column; justify-content: center; align-items: center;">
                     <div class="spinner-border text-primary mb-3 spin" role="status" style="width: 2.5rem; height: 2.5rem;"></div>
                     <h6 class="fw-bold text-slate-800">正在同步汇总行动要素...</h6>
-                    <p class="text-muted small px-3">本周重点关注学生、薄弱知识点及关联补练题目正由 AI 从诊断报告中提炼，报告流完后将呈现在此处。</p>
+                    <p class="text-muted small px-3">报告会边生成边显示；如果上游迟迟没有首段，系统会自动切换快速报告。</p>
                 </div>
             </div>
             

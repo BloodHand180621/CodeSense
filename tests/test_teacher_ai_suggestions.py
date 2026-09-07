@@ -257,6 +257,36 @@ class TeacherAISuggestionsTestCase(unittest.TestCase):
         self.assertNotIn('===JSON===', visible)
         self.assertEqual(fake_llm.request_kind, 'interactive')
 
+    def test_stream_completes_with_markdown_when_legacy_json_tail_is_invalid(self):
+        class FakeLLM:
+            def is_available(self):
+                return True
+
+            def chat_stream(self, messages, **kwargs):
+                return iter([
+                    '## 可用的 AI 正文\n\n先给出教学建议。',
+                    '===JSON===\n{"attention_students": [',
+                ])
+
+        fake_llm = FakeLLM()
+        with self.app.app_context(), patch(
+            'services.teacher_ai_advisor.SharedLLMClient', return_value=fake_llm
+        ):
+            events = [
+                json.loads(line[6:])
+                for line in generate_class_suggestions_stream(self.class_id, self.teacher_id)
+                if line.startswith('data: ')
+            ]
+
+        self.assertEqual(events[-1]['type'], 'done')
+        self.assertNotIn('error', [event['type'] for event in events])
+        visible = ''.join(
+            event.get('content', '') for event in events if event['type'] == 'delta'
+        )
+        self.assertIn('可用的 AI 正文', visible)
+        self.assertNotIn('===JSON===', visible)
+        self.assertIn('attention_students', events[-1]['suggestion_json'])
+
 if __name__ == '__main__':
     unittest.main()
 
