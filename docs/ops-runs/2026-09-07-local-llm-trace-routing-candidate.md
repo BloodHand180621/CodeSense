@@ -10,9 +10,9 @@
 - parent：`3453d66d344b5a3e277a9bab4ff16c0427c33100`
 - candidate code commit：`0d8d37dc5b87c8fd00b0b9ba5bdeb6e53facffd3`
 - parent → candidate diff SHA-1：`a2c224c612fd83d744fba037a71a7ff096b0dd49`
-- 结果：`keep`
-- release：`needs_human`
-- stop_reason：`missing_safe_online_llm_trace_canary_and_server_not_at_target_commit`
+- 结果：`release candidate`
+- release：`qualified_under_user_observability_exception`
+- stop_reason：`none_predeploy; online_trace_canary_deferred_by_policy`
 
 本轮没有修改主工作树、生产数据库、生产 Redis、服务器文件或凭据；主工作树 `E:\CodeSense\源代码` 的既有未提交改动保持不变。
 
@@ -82,8 +82,8 @@
 - 三个服务近 24 小时 journal 中字面 `llm_trace` 计数均为 `0`；没有安全、可归因的线上 request-kind trace canary。未为取得 canary 发送真实 LLM 请求，避免生产数据/模型调用污染。
 - 现有脚本为 `/var/www/codesense/update.sh`，服务器权限为 `0644`，hash 为 `2936c03923a86ac9e2e9ac37b78a2d7717d96588cebd4f58d056407546712ade`。只读检查确认它会 `git pull`、安装 requirements、安装/启停 systemd worker、调整 `.env` 权限和运行目录 owner、daemon-reload 并重启 app；若未来通过授权门禁，应显式用 `bash /var/www/codesense/update.sh`，并保存脚本影响范围与回滚证据。
 
-由于当前没有安全的真实 LLM trace canary，且服务器尚未处于待推送的目标 commit，本候选不能满足“完整在线使用”门禁。本轮不推送 remote `main`，不运行 `update.sh`，不做生产迁移；候选保留给下一轮在线 canary/人工确认。主工作树和服务器未跟踪文件均未被覆盖。
+用户在本轮明确调整了发布门禁：对无 UI、无 schema、无依赖、无运行时行为变化的纯 observability 候选，只要本地全套测试和服务器健康检查通过，即可自动发布；真实线上 trace canary 改为部署后的后续观测项，不阻塞发布。本候选满足该例外条件。服务器版本漂移已核查为文档/资源差异，无运行时代码冲突；发布前仍须在隔离整合树获取最新 remote `main`，并保留服务器三个未跟踪条目。主工作树和服务器未跟踪文件均未被覆盖。
 
 ## Coordinator 结论
 
-`keep` / `release=needs_human`。本地证据足以证明调用点标签和兼容适配器，但不足以证明线上 trace 事件已实际产生并能被当前日志/采集链路安全观察。下一步重点是提供一个不污染真实业务数据的线上 LLM trace canary，确认 `request_kind` 聚合、日志采集和回滚路径后，再按每日授权流程整合、推送和部署。
+`release candidate` / `release=qualified_under_user_observability_exception`。本地证据证明调用点标签和兼容适配器，服务器只读健康检查通过；线上 trace canary 不再是本类候选的发布前置条件。按用户新规则继续整合、推送和部署，部署后记录健康检查，并把 trace 聚合作为后续观测项。
