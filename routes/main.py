@@ -23,6 +23,7 @@ from services.teacher_analytics import build_teacher_dashboard_data
 from services.demo_database import current_demo_run_id
 from utils.auth import admin_required
 from utils.maturity_calculator import calculate_maturity_components
+from utils.sse import sse_event, sse_response
 from utils.timezone import format_display_datetime
 
 main = Blueprint('main', __name__)
@@ -703,33 +704,25 @@ def api_teacher_suggestion_status(class_id):
 def api_stream_teacher_suggestions():
     """流式生成并返回班级 AI 建议 (SSE)"""
     if not current_user.is_teacher:
-        return Response(f"data: {json.dumps({'type': 'error', 'message': '仅教师可执行此操作'})}\n\n", mimetype='text/event-stream')
+        return sse_response([sse_event({'type': 'error', 'message': '仅教师可执行此操作'})])
 
     class_id = request.args.get('class_id', type=int)
     if not class_id:
-        return Response(f"data: {json.dumps({'type': 'error', 'message': '参数缺失 class_id'})}\n\n", mimetype='text/event-stream')
+        return sse_response([sse_event({'type': 'error', 'message': '参数缺失 class_id'})])
 
     from models import Class
     cls = Class.query.get_or_404(class_id)
     if cls.teacher_id != current_user.student_id:
-        return Response(f"data: {json.dumps({'type': 'error', 'message': '您无权管理此班级'})}\n\n", mimetype='text/event-stream')
+        return sse_response([sse_event({'type': 'error', 'message': '您无权管理此班级'})])
 
     from services.teacher_ai_advisor import generate_class_suggestions_stream
-    from flask import Response, stream_with_context
 
-    return Response(
-        stream_with_context(
-            generate_class_suggestions_stream(
-                cls.id,
-                current_user.student_id,
-                demo_run_id=current_demo_run_id(),
-            )
-        ),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
+    return sse_response(
+        generate_class_suggestions_stream(
+            cls.id,
+            current_user.student_id,
+            demo_run_id=current_demo_run_id(),
+        )
     )
 
 

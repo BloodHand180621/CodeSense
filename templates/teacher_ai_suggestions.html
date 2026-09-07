@@ -362,7 +362,7 @@
         });
     });
 
-    // 触发并流式获取建议生成过程
+    // 触发并流式获取建议生成过程。所有 AI 文本流统一走 consumeSSE。
     function startSuggestionStream(classId, buttonElement = null) {
         // 动画控制：旋转图标并禁用按钮
         if (buttonElement) {
@@ -384,90 +384,142 @@
             contentContainer.classList.add('d-none');
         }
 
-        // 如果该班级已经存在流式连接，先关闭之
-        if (window.suggestionEventSources && window.suggestionEventSources[classId]) {
-            window.suggestionEventSources[classId].close();
+        if (!window.suggestionStreams) {
+            window.suggestionStreams = {};
         }
-        if (!window.suggestionEventSources) {
-            window.suggestionEventSources = {};
-        }
+        const previous = window.suggestionStreams[classId];
+        if (previous && previous.controller) previous.controller.abort();
 
-        // 建立 Server-Sent Events 连接
-        const source = new EventSource(`/api/teacher/stream_suggestions?class_id=${classId}`);
-        window.suggestionEventSources[classId] = source;
-
+        const controller = new AbortController();
+        const streamToken = `${classId}-${Date.now()}-${Math.random()}`;
+        window.suggestionStreams[classId] = { controller, streamToken };
+        const startedAt = performance.now();
         let markdownBuffer = "";
+        let renderTimer = null;
         let hasInitializedUI = false;
+        let streamReportedError = false;
+        let firstVisibleAt = null;
 
-        source.onmessage = function(event) {
-            const data = JSON.parse(event.data);
+        const isCurrentStream = () => (
+            window.suggestionStreams[classId] &&
+            window.suggestionStreams[classId].streamToken === streamToken
+        );
 
-            if (data.type === 'status') {
-                // 更新阶段性状态消息
-                if (statusContainer) {
-                    statusContainer.querySelector('p').innerText = data.message;
-                }
-            } else if (data.type === 'start') {
-                // AI 开始输出，初始化实时流界面布局
-                hasInitializedUI = true;
-                if (statusContainer) statusContainer.classList.add('d-none');
-                if (contentContainer) {
-                    contentContainer.innerHTML = getStreamingUILayout(classId);
-                    contentContainer.classList.remove('d-none');
-                }
-            } else if (data.type === 'chunk') {
-                // 安全判定：若没收到 start 事件就已经到了数据块，强制进行 UI 初始化
-                if (!hasInitializedUI) {
-                    hasInitializedUI = true;
-                    if (statusContainer) statusContainer.classList.add('d-none');
-                    if (contentContainer) {
-                        contentContainer.innerHTML = getStreamingUILayout(classId);
-                        contentContainer.classList.remove('d-none');
-                    }
-                }
-                markdownBuffer += data.content;
-                const reportContentDiv = document.querySelector(`.report-content-box-${classId}`);
-                if (reportContentDiv && typeof marked !== 'undefined') {
-                    // 使用 marked 渲染实时 Markdown
-                    reportContentDiv.innerHTML = marked.parse(markdownBuffer);
-                    
-                    // 滚动到底部以提升观感
-                    reportContentDiv.scrollTop = reportContentDiv.scrollHeight;
-                }
-            } else if (data.type === 'complete') {
-                // 传输完成，断开流连接
-                source.close();
-                delete window.suggestionEventSources[classId];
-                
-                // 将 markdown 块与结构化 JSON 组合，渲染最终页面
-                const finalData = {
-                    suggestion_markdown: markdownBuffer || data.suggestion_markdown || "分析报告生成成功",
-                    suggestion_json: data.suggestion_json,
-                    last_updated: data.last_updated
-                };
-                updateSuggestionUI(classId, finalData);
-                
-                // 复位刷新按钮状态
-                if (buttonElement) {
-                    buttonElement.disabled = false;
-                    const icon = buttonElement.querySelector('.btn-refresh-icon');
-                    if (icon) icon.classList.remove('spin');
-                }
-            } else if (data.type === 'error') {
-                source.close();
-                delete window.suggestionEventSources[classId];
-                alert('流式生成 AI 建议失败: ' + (data.message || '系统繁忙'));
-                resetRefreshButton(classId, buttonElement);
+        const ensureStreamingUI = () => {
+            if (hasInitializedUI) return;
+            hasInitializedUI = true;
+            if (statusContainer) statusContainer.classList.add('d-none');
+            if (contentContainer) {
+                contentContainer.innerHTML = getStreamingUILayout(classId);
+                contentContainer.classList.remove('d-none');
             }
         };
 
-        source.onerror = function(err) {
-            console.error('SSE connection error:', err);
-            source.close();
-            delete window.suggestionEventSources[classId];
-            alert('AI 诊断流连接异常中断，建议您刷新页面重试。');
-            resetRefreshButton(classId, buttonElement);
+        const renderStreamingMarkdown = () => {
+            renderTimer = null;
+            if (!isCurrentStream()) return;
+            const reportContentDiv = document.querySelector(`.report-content-box-${classId}`);
+            if (!reportContentDiv) return;
+            const stickToBottom = reportContentDiv.scrollHeight - reportContentDiv.scrollTop - reportContentDiv.clientHeight < 64;
+            if (typeof marked !== 'undefined') {
+                reportContentDiv.innerHTML = marked.parse(markdownBuffer);
+            } else {
+                reportContentDiv.textContent = markdownBuffer;
+            }
+            if (stickToBottom) reportContentDiv.scrollTop = reportContentDiv.scrollHeight;
         };
+
+        const scheduleRender = (flush = false) => {
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+            }
+            if (flush) {
+                renderStreamingMarkdown();
+                return;
+            }
+            // Keep network delivery independent from Markdown/DOM work.
+            renderTimer = setTimeout(renderStreamingMarkdown, 50);
+        };
+
+        window.consumeSSE(`/api/teacher/stream_suggestions?class_id=${encodeURIComponent(classId)}`, {
+            method: 'GET',
+            signal: controller.signal
+        }, {
+            onStatus: data => {
+                if (!isCurrentStream()) return;
+                if (statusContainer) {
+                    statusContainer.querySelector('p').innerText = data.message || '正在分析班级学情...';
+                }
+            },
+            onStart: data => {
+                if (!isCurrentStream()) return;
+                ensureStreamingUI();
+                const reportContentDiv = document.querySelector(`.report-content-box-${classId}`);
+                if (reportContentDiv && data.message) {
+                    reportContentDiv.setAttribute('aria-label', data.message);
+                }
+            },
+            onDelta: data => {
+                if (!isCurrentStream()) return;
+                ensureStreamingUI();
+                if (firstVisibleAt === null) firstVisibleAt = performance.now();
+                markdownBuffer += data.content || '';
+                scheduleRender();
+            },
+            onDone: data => {
+                if (!isCurrentStream()) return;
+                scheduleRender(true);
+                updateSuggestionUI(classId, {
+                    suggestion_markdown: markdownBuffer || data.suggestion_markdown || "分析报告生成成功",
+                    suggestion_json: data.suggestion_json || {
+                        attention_students: [],
+                        weak_knowledge_points: [],
+                        suggested_assignments: [],
+                    },
+                    last_updated: data.last_updated
+                });
+                console.debug('[AI stream metrics] teacher-suggestions', {
+                    firstVisibleMs: firstVisibleAt === null ? null : Math.round(firstVisibleAt - startedAt),
+                    durationMs: Math.round(performance.now() - startedAt),
+                    server: data.stream_metrics || null,
+                });
+                resetRefreshButton(classId, buttonElement);
+            },
+            onError: data => {
+                if (!isCurrentStream()) return;
+                streamReportedError = true;
+                scheduleRender(true);
+                showTeacherStreamError(classId, data.message || data.error || '系统繁忙');
+                resetRefreshButton(classId, buttonElement);
+                controller.abort();
+            },
+            onMetrics: metrics => {
+                if (isCurrentStream()) {
+                    console.debug('[AI stream metrics] teacher-suggestions', metrics);
+                }
+            }
+        }).catch(error => {
+            if (!isCurrentStream() || streamReportedError || error.name === 'AbortError') return;
+            console.error('SSE connection error:', error);
+            showTeacherStreamError(classId, '连接中断，已保留已生成内容；请点击“刷新 AI 建议”重试。');
+            resetRefreshButton(classId, buttonElement);
+        }).finally(() => {
+            if (isCurrentStream()) delete window.suggestionStreams[classId];
+        });
+    }
+
+    function showTeacherStreamError(classId, message) {
+        const reportContentDiv = document.querySelector(`.report-content-box-${classId}`);
+        if (!reportContentDiv) {
+            alert('流式生成 AI 建议失败: ' + message);
+            return;
+        }
+        const error = document.createElement('div');
+        error.className = 'alert alert-warning mt-3 mb-0';
+        error.innerHTML = '<i class="bi bi-exclamation-triangle me-2"></i>';
+        error.appendChild(document.createTextNode(message));
+        reportContentDiv.appendChild(error);
     }
 
     // 复位按钮与布局

@@ -213,3 +213,22 @@ def test_stage1_hint_stream_persists_final_hint(ai_sse_context, monkeypatch):
     with client.application.app_context():
         session = db.session.get(ThinkingSession, session_id)
         assert session.stage1_hint_count == 1
+
+
+def test_ability_analysis_uses_common_sse_protocol(ai_sse_context, monkeypatch):
+    _, client, _, _ = ai_sse_context
+    from tasks import ability_analysis
+
+    # Avoid starting a background job; the route contract is what is under test.
+    monkeypatch.setattr(ability_analysis, 'trigger_analysis_if_needed', lambda *args, **kwargs: True)
+
+    response = client.get('/api/stream/ability-analysis')
+    assert response.status_code == 200
+    events = _events(response)
+
+    assert events[0]['type'] == 'status'
+    assert events[0]['phase'] == 'progress'
+    assert events[-1] == {'type': 'done', 'done': True}
+    assert 'start' in [event['type'] for event in events]
+    assert 'delta' in [event['type'] for event in events]
+    assert not any(event['type'] in {'analysis_start', 'analysis_chunk', 'complete'} for event in events)

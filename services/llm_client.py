@@ -79,6 +79,9 @@ class _LLMTrace:
     started_at: float = field(default_factory=time.perf_counter, repr=False)
     queue_wait_ms: float = 0.0
     llm_latency_ms: float = 0.0
+    time_to_first_chunk_ms: Optional[float] = None
+    stream_chunks: int = 0
+    output_chars: int = 0
     attempts: int = 0
     providers_tried: List[str] = field(default_factory=list)
     models_tried: List[str] = field(default_factory=list)
@@ -119,6 +122,18 @@ class _LLMTrace:
     def note_error(self, error: Optional[Exception]) -> None:
         if error is not None:
             self.error_class = _failure_code(error)
+
+    def record_chunk(self, content: str) -> None:
+        """Record bounded stream timing without retaining model output."""
+
+        if not content:
+            return
+        if self.time_to_first_chunk_ms is None:
+            self.time_to_first_chunk_ms = max(
+                0.0, (time.perf_counter() - self.started_at) * 1000.0
+            )
+        self.stream_chunks += 1
+        self.output_chars += len(content)
 
     def finish(
         self,
@@ -169,6 +184,14 @@ class _LLMTrace:
             payload["models_tried"] = self.models_tried[:4]
         if self.error_class:
             payload["error_class"] = self.error_class
+        if self.stream:
+            payload["time_to_first_chunk_ms"] = (
+                round(self.time_to_first_chunk_ms, 2)
+                if self.time_to_first_chunk_ms is not None
+                else None
+            )
+            payload["stream_chunks"] = self.stream_chunks
+            payload["output_chars"] = self.output_chars
         logger.info("llm_trace %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
         self._emitted = True
 
@@ -711,6 +734,11 @@ class SharedLLMClient:
         cached = self._cache_get(cache_key)
         if cached:
             trace.cache_hit = True
+            trace.time_to_first_chunk_ms = max(
+                0.0, (time.perf_counter() - trace.started_at) * 1000.0
+            )
+            trace.stream_chunks = (len(cached) + 63) // 64
+            trace.output_chars = len(cached)
             trace.finish("cache_hit", provider=self.provider, model=self.model_name)
             trace.emit()
             for index in range(0, len(cached), 64):
@@ -744,6 +772,7 @@ class SharedLLMClient:
                             content = _stream_chunk_content(chunk)
                             if content:
                                 emitted = True
+                                trace.record_chunk(content)
                                 chunks.append(content)
                                 yield content
                         if not chunks:

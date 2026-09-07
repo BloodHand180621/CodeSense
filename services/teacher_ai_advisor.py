@@ -1,11 +1,13 @@
 import json
 import logging
 import threading
+import time
 from datetime import datetime as dt
 from models import db, User, Class, KnowledgePointScore, Assignment, AssignmentKnowledgePoint, TeacherAISuggestion
 from services.teacher_analytics import build_class_learning_rows
 from services.llm_client import SharedLLMClient
 from services.demo_database import activate_demo_run, is_active_demo_run
+from utils.sse import sse_event, stream_text_chunks
 from utils.timezone import format_display_datetime
 
 
@@ -408,7 +410,7 @@ def generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None):
             class_id,
             type(exc).__name__,
         )
-        yield f"data: {json.dumps({'type': 'error', 'message': '流式生成 AI 建议失败，请刷新重试'})}\n\n"
+        yield sse_event({'type': 'error', 'message': '流式生成 AI 建议失败，请刷新重试'})
 
 
 def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *, state=None):
@@ -416,14 +418,14 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
     流式生成班级学情建议，计算规则引擎结果，并流式输出LLM反馈报告，最后保存入库
     """
     if demo_run_id and not activate_demo_run(demo_run_id):
-        yield f"data: {json.dumps({'type': 'error', 'message': '体验会话已结束，请重新进入演示'})}\n\n"
+        yield sse_event({'type': 'error', 'message': '体验会话已结束，请重新进入演示'})
         return
 
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在读取班级基本数据...'})}\n\n"
+    yield sse_event({'type': 'status', 'message': '正在读取班级基本数据...'})
     
     cls = Class.query.get(class_id)
     if not cls:
-        yield f"data: {json.dumps({'type': 'error', 'message': '班级未找到'})}\n\n"
+        yield sse_event({'type': 'error', 'message': '班级未找到'})
         return
 
     suggestion = TeacherAISuggestion.get_or_create(class_id=class_id, teacher_id=teacher_id)
@@ -432,7 +434,7 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
     suggestion.status = 'processing'
     db.session.commit()
 
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在分析学生提交与风险情况...'})}\n\n"
+    yield sse_event({'type': 'status', 'message': '正在分析学生提交与风险情况...'})
     students = User.query.filter_by(class_id=class_id, usertype='学生').all()
     student_ids = [s.student_id for s in students]
 
@@ -448,7 +450,7 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
                     'latest_score': row['latest_score']
                 })
 
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在聚合知识点雷达掌握度...'})}\n\n"
+    yield sse_event({'type': 'status', 'message': '正在聚合知识点雷达掌握度...'})
     weak_points = []
     if student_ids:
         rows = db.session.query(
@@ -473,7 +475,7 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
                 'total_attempts': int(row.total_attempts) if row.total_attempts else 0
             })
 
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在匹配系统作业并生成推荐大纲...'})}\n\n"
+    yield sse_event({'type': 'status', 'message': '正在匹配系统作业并生成推荐大纲...'})
     suggested_assignments = []
     if weak_points:
         weak_kp_codes = [wp['code'] for wp in weak_points[:3]]
@@ -528,10 +530,13 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
     }
 
     llm = SharedLLMClient()
+    stream_started_at = time.perf_counter()
+    yield sse_event({'type': 'status', 'message': '正在与 AI 助手建立流式会话...'})
+    # `start` is sent before the model call so the user sees the report shell
+    # during provider time-to-first-token, not only after the first text chunk.
+    yield sse_event({'type': 'start', 'message': 'AI 已连接，正在生成报告...'})
     if llm.is_available():
         try:
-            yield f"data: {json.dumps({'type': 'status', 'message': '正在与 AI 助手建立流式会话...'})}\n\n"
-            
             attention_details_str = "\n".join([
                 f"- {s['name']} ({s['student_id']}): 风险标签 {s['risk_tags']}, 最近得分 {s['latest_score']}" 
                 for s in attention_students
@@ -594,17 +599,44 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
 
             full_text = ""
             json_started = False
-            has_sent_start = False
-            
-            for chunk in llm.chat_stream(messages, request_kind="background"):
+            delimiter = '===JSON==='
+            delimiter_tail = ''
+            first_visible_at = None
+            visible_chunks = 0
+
+            # Keep only the suffix that could still become the structured
+            # response delimiter. This preserves normal Markdown immediately,
+            # even when the provider splits the delimiter across chunks.
+            for chunk in llm.chat_stream(messages, request_kind="interactive"):
+                if not chunk:
+                    continue
+                chunk = str(chunk)
                 full_text += chunk
-                if "===" in chunk or "JSON" in chunk or json_started:
+                if json_started:
+                    continue
+
+                candidate = delimiter_tail + chunk
+                delimiter_index = candidate.find(delimiter)
+                if delimiter_index >= 0:
+                    visible = candidate[:delimiter_index]
+                    delimiter_tail = ''
                     json_started = True
                 else:
-                    if not has_sent_start:
-                        yield f"data: {json.dumps({'type': 'start'})}\n\n"
-                        has_sent_start = True
-                    yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                    keep_length = min(len(delimiter) - 1, len(candidate))
+                    visible = candidate[:-keep_length] if keep_length else candidate
+                    delimiter_tail = candidate[-keep_length:] if keep_length else ''
+
+                if visible:
+                    if first_visible_at is None:
+                        first_visible_at = time.perf_counter()
+                    visible_chunks += 1
+                    yield sse_event({'type': 'delta', 'content': visible})
+
+            if not json_started and delimiter_tail:
+                if first_visible_at is None:
+                    first_visible_at = time.perf_counter()
+                visible_chunks += 1
+                yield sse_event({'type': 'delta', 'content': delimiter_tail})
 
             # 提取 JSON 部分
             parts = full_text.split('===JSON===')
@@ -628,7 +660,19 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
                     suggestion.last_updated = dt.utcnow()
                     db.session.commit()
                     
-                    yield f"data: {json.dumps({'type': 'complete', 'suggestion_json': parsed_json, 'last_updated': format_display_datetime(suggestion.last_updated)})}\n\n"
+                    yield sse_event({
+                        'type': 'done',
+                        'done': True,
+                        'suggestion_json': parsed_json,
+                        'last_updated': format_display_datetime(suggestion.last_updated),
+                        'stream_metrics': {
+                            'first_visible_ms': round(
+                                (first_visible_at - stream_started_at) * 1000, 2
+                            ) if first_visible_at else None,
+                            'output_chars': len(markdown_part),
+                            'stream_chunks': visible_chunks,
+                        },
+                    })
                     return
             except Exception as je:
                 logger.warning(
@@ -643,23 +687,24 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
         if demo_run_id:
             if _demo_database_is_available(demo_run_id):
                 _mark_demo_suggestion_failed(class_id, teacher_id)
-            yield f"data: {json.dumps({'type': 'error', 'message': '真实 AI 建议生成失败，请稍后重试'})}\n\n"
+            yield sse_event({'type': 'error', 'message': '真实 AI 建议生成失败，请稍后重试'})
             return
 
     elif demo_run_id:
         if _demo_database_is_available(demo_run_id):
             _mark_demo_suggestion_failed(class_id, teacher_id)
-        yield f"data: {json.dumps({'type': 'error', 'message': 'AI 服务当前不可用，请稍后重试'})}\n\n"
+        yield sse_event({'type': 'error', 'message': 'AI 服务当前不可用，请稍后重试'})
         return
 
     # Fallback to rules-based
-    yield f"data: {json.dumps({'type': 'start'})}\n\n"
-    chunk_size = 30
-    import time
-    for i in range(0, len(rule_markdown), chunk_size):
-        chunk = rule_markdown[i:i+chunk_size]
-        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
-        time.sleep(0.04)
+    fallback_started_at = time.perf_counter()
+    fallback_first_visible_at = None
+    fallback_chunks = 0
+    for chunk in stream_text_chunks(rule_markdown, max_chars=160):
+        if fallback_first_visible_at is None:
+            fallback_first_visible_at = time.perf_counter()
+        fallback_chunks += 1
+        yield sse_event({'type': 'delta', 'content': chunk})
 
     suggestion.suggestion_markdown = rule_markdown
     suggestion.suggestion_json = json.dumps(rule_json_dict, ensure_ascii=False)
@@ -667,5 +712,17 @@ def _generate_class_suggestions_stream(class_id, teacher_id, demo_run_id=None, *
     suggestion.last_updated = dt.utcnow()
     db.session.commit()
 
-    yield f"data: {json.dumps({'type': 'complete', 'suggestion_json': rule_json_dict, 'last_updated': format_display_datetime(suggestion.last_updated)})}\n\n"
+    yield sse_event({
+        'type': 'done',
+        'done': True,
+        'suggestion_json': rule_json_dict,
+        'last_updated': format_display_datetime(suggestion.last_updated),
+        'stream_metrics': {
+            'first_visible_ms': round(
+                (fallback_first_visible_at - fallback_started_at) * 1000, 2
+            ) if fallback_first_visible_at else None,
+            'output_chars': len(rule_markdown),
+            'stream_chunks': fallback_chunks,
+        },
+    })
 

@@ -16,7 +16,7 @@ from utils.guidance_generator import (
     generate_answer_to_question_stream,
 )  # 导入指导生成函数和答案生成函数
 from utils.code_advisor import generate_code_advice  # 导入新的代码建议系统
-from utils.sse import sse_event, sse_response, wants_sse
+from utils.sse import sse_event, sse_response, stream_text_chunks, wants_sse
 from services.ai_evaluator import AIEvaluator
 from services.api_keys import api_keys  # 导入 API 密钥管理器
 from services.demo_database import current_demo_run_id
@@ -1212,8 +1212,7 @@ def format_assignment():
                 return
             ai_evaluator = AIEvaluator()
             for chunk in ai_evaluator.format_assignment_text(raw_text):
-                # ``token`` 保留给旧页面，``content`` 是统一增量字段。
-                yield sse_event({'type': 'delta', 'content': chunk, 'token': chunk})
+                yield sse_event({'type': 'delta', 'content': chunk})
             # 流结束后，发送真实可用的 ID 覆盖 AI 的建议
             final_payload = {'type': 'done', 'done': True}
             if next_available_id is not None:
@@ -1235,7 +1234,7 @@ def stream_ability_analysis():
     流式返回学生能力分析（从缓存读取）
     使用Server-Sent Events (SSE)实时推送分析结果
     """
-    from flask import current_app, stream_with_context
+    from flask import current_app
     from models import KnowledgePointScore, AbilityTrend
     from tasks.ability_analysis import trigger_analysis_if_needed
     demo_run_id = current_demo_run_id()
@@ -1244,17 +1243,31 @@ def stream_ability_analysis():
         try:
             student_id = session.get('student_id')
             if not student_id:
-                yield f"data: {json.dumps({'type': 'error', 'message': '未登录'})}\n\n"
+                yield sse_event({'type': 'error', 'message': '未登录'})
                 return
 
             # 1. 立即返回知识点画像数据
-            yield f"data: {json.dumps({'type': 'progress', 'percent': 10, 'message': '正在加载知识点数据...'})}\n\n"
+            yield sse_event({
+                'type': 'status',
+                'phase': 'progress',
+                'percent': 10,
+                'message': '正在加载知识点数据...',
+            })
 
             knowledge_profile = KnowledgePointScore.get_student_profile(student_id)
-            yield f"data: {json.dumps({'type': 'knowledge_profile', 'data': knowledge_profile})}\n\n"
+            yield sse_event({
+                'type': 'data',
+                'name': 'knowledge_profile',
+                'data': knowledge_profile,
+            })
 
             # 2. 检查能力分析缓存
-            yield f"data: {json.dumps({'type': 'progress', 'percent': 30, 'message': '正在加载分析数据...'})}\n\n"
+            yield sse_event({
+                'type': 'status',
+                'phase': 'progress',
+                'percent': 30,
+                'message': '正在加载分析数据...',
+            })
 
             ability_trend = AbilityTrend.query.filter_by(student_id=student_id).first()
 
@@ -1271,108 +1284,64 @@ def stream_ability_analysis():
                         student_id=student_id
                     ).first()
                     if ability_trend and ability_trend.status == 'failed':
-                        yield f"data: {json.dumps({'type': 'analysis_start'})}\n\n"
+                        yield sse_event({'type': 'start', 'message': '分析暂时不可用'})
                         content = (
                             '### 分析暂时不可用\n\n'
                             '本次没有自动重试，避免重复调用。请稍后点击刷新分析重试。'
                         )
-                        yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content})}\n\n"
-                        yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                        yield sse_event({'type': 'delta', 'content': content})
+                        yield sse_event({'type': 'done', 'done': True})
                         return
 
                 # 返回提示信息
-                yield f"data: {json.dumps({'type': 'analysis_start'})}\n\n"
+                yield sse_event({'type': 'start', 'message': '分析任务已进入后台'})
                 content1 = '### 正在生成分析\n\n'
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content1})}\n\n"
+                yield sse_event({'type': 'delta', 'content': content1})
                 content2 = '您的能力分析正在后台生成中，请稍后刷新页面查看完整分析。\n\n'
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content2})}\n\n"
+                yield sse_event({'type': 'delta', 'content': content2})
                 content3 = '💡 **提示**：生成过程大约需要10-30秒，您可以继续浏览其他页面。'
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content3})}\n\n"
-                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                yield sse_event({'type': 'delta', 'content': content3})
+                yield sse_event({'type': 'done', 'done': True})
                 return
 
             # 如果正在处理中
             if ability_trend.status == 'processing':
-                yield f"data: {json.dumps({'type': 'analysis_start'})}\n\n"
+                yield sse_event({'type': 'start', 'message': '分析仍在后台生成'})
                 content1 = '### 分析生成中\n\n'
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content1})}\n\n"
+                yield sse_event({'type': 'delta', 'content': content1})
                 content2 = '您的能力分析正在后台生成中...\n\n'
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content2})}\n\n"
+                yield sse_event({'type': 'delta', 'content': content2})
                 content3 = '⏳ 请稍候片刻，然后刷新页面查看结果。'
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': content3})}\n\n"
-                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                yield sse_event({'type': 'delta', 'content': content3})
+                yield sse_event({'type': 'done', 'done': True})
                 return
 
             # 3. 流式输出缓存的分析结果
-            yield f"data: {json.dumps({'type': 'progress', 'percent': 60, 'message': '正在加载分析结果...'})}\n\n"
-            yield f"data: {json.dumps({'type': 'analysis_start'})}\n\n"
+            yield sse_event({
+                'type': 'status',
+                'phase': 'progress',
+                'percent': 60,
+                'message': '正在加载分析结果...',
+            })
+            yield sse_event({'type': 'start', 'message': '正在展示分析结果'})
 
             if ability_trend.analysis_markdown:
-                # 逐字输出，真正的打字机效果（带错误模拟）
+                # 缓存内容已经完整生成，不再人为逐字限速或模拟错字。
                 analysis_text = ability_trend.analysis_markdown
-                import time
-                import random
-
-                # 每次输出2-4个字符，模拟自然流畅的打字速度
-                i = 0
-                while i < len(analysis_text):
-                    # 智能分块：优先在词语边界处分割
-                    chunk_size = 2  # 默认2个字符，更细腻
-
-                    # 查找附近的标点或空格
-                    next_punctuation = i + chunk_size
-                    for j in range(i + 1, min(i + 6, len(analysis_text))):
-                        if analysis_text[j] in '，。！？、；：,.!?;: \n':
-                            next_punctuation = j + 1
-                            break
-
-                    # 如果标点很近（在6个字符内），就输出到标点位置
-                    if next_punctuation - i <= 6:
-                        chunk_size = next_punctuation - i
-                    else:
-                        chunk_size = 2  # 否则输出2个字符
-
-                    chunk = analysis_text[i:i+chunk_size]
-
-                    # 5%的概率模拟打错字（只在中文字符时）
-                    if random.random() < 0.05 and i > 10 and '\u4e00' <= chunk[0] <= '\u9fff':
-                        # 打错字效果
-                        typo_chars = ['的', '了', '是', '在', '有', '个', '人', '这', '中', '大']
-                        typo = random.choice(typo_chars)
-
-                        # 先输出错误的字
-                        yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': typo})}\n\n"
-                        time.sleep(0.08)  # 打错字稍慢
-
-                        # 然后删除（使用退格符模拟）
-                        yield f"data: {json.dumps({'type': 'analysis_typo_delete', 'count': len(typo)})}\n\n"
-                        time.sleep(0.05)  # 删除稍快
-
-                    # 输出正确的内容
-                    yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': chunk})}\n\n"
-                    i += chunk_size
-
-                    # 更慢更流畅的延迟：每个块50ms，约40-50字/秒（类似真人打字速度）
-                    time.sleep(0.05)
+                for chunk in stream_text_chunks(analysis_text, max_chars=160):
+                    yield sse_event({'type': 'delta', 'content': chunk})
             else:
                 # 没有分析内容
-                yield f"data: {json.dumps({'type': 'analysis_chunk', 'content': '暂无分析数据'})}\n\n"
+                yield sse_event({'type': 'delta', 'content': '暂无分析数据'})
 
             # 5. 完成
-            yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+            yield sse_event({'type': 'done', 'done': True})
 
         except Exception as e:
             current_app.logger.error(f"流式分析出错: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'分析出错: {str(e)}'})}\n\n"
+            yield sse_event({'type': 'error', 'message': f'分析出错: {str(e)}'})
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
-    )
+    return sse_response(generate())
 
 # -- Test Case Validation & Management API --
 

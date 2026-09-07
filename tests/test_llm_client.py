@@ -251,6 +251,9 @@ def test_stream_trace_records_interruption_without_payload(caplog):
     assert trace["stream"] is True
     assert trace["stop_reason"] == "stream_interrupted"
     assert trace["error_class"] == "NETWORK_UNAVAILABLE"
+    assert trace["time_to_first_chunk_ms"] is not None
+    assert trace["stream_chunks"] == 1
+    assert trace["output_chars"] == len("已经输出")
     assert "private stream payload" not in caplog.text
 
 
