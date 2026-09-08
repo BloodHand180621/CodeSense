@@ -106,6 +106,13 @@ def test_guidance_sse_streams_deltas_and_keeps_json_compatibility(ai_sse_context
 
 def test_assignment_generation_streams_model_tokens(monkeypatch, teacher_client):
     import openai
+    from services.llm_client import SharedLLMClient
+
+    # This test asserts provider chunk boundaries.  Keep the shared LLM cache
+    # out of the scenario so a previous test run cannot replay the response in
+    # its fixed-size cache chunks instead of exercising the fake provider.
+    monkeypatch.setattr(SharedLLMClient, "_cache_get", lambda self, key: None)
+    monkeypatch.setattr(SharedLLMClient, "_cache_set", lambda self, key, value: None)
 
     class FakeCompletions:
         def create(self, **kwargs):

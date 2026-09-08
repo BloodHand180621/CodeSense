@@ -113,3 +113,9 @@
 ## Stop reason
 
 `preexisting_full_suite_failures_block_observability_exception`
+
+## 后续隔离修复（2026-09-08）
+
+复跑确认 SSE 失败的根因是测试污染了本机 Redis DB0：固定 prompt 的 provider 响应被缓存，后续测试命中缓存后按 64 字符重放，因而只有一个 `delta`，并非生产流式逻辑改变。`tests/test_ai_sse_routes.py::test_assignment_generation_streams_model_tokens` 现对该 provider 分片断言禁用共享 cache 读写，确保测试始终调用 fake provider 并验证真实分片边界；没有修改线上 SSE 行为。
+
+修复后的验证：SSE 文件 `6 passed`；submission worker 单项 `1 passed`；使用不可达的本地 Redis 地址隔离外部缓存后完整 pytest `408 passed`（`322.10s`）。
