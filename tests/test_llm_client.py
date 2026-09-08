@@ -131,6 +131,26 @@ def test_chat_emits_redacted_trace_for_retry(caplog, monkeypatch):
     assert trace["duration_ms"] >= trace["llm_latency_ms"]
 
 
+def test_chat_trace_inherits_flask_request_id_without_logging_prompt(caplog):
+    fake = FakeProviderClient(["请求内回答"])
+    client = make_client({LLMProvider.ZHIPU: fake})
+    caplog.set_level(llm_module.logging.INFO, logger="services.llm_client")
+
+    from flask import Flask, g
+
+    app = Flask(__name__)
+    with app.test_request_context("/private/path"):
+        g.codesense_request_id = "11111111-1111-4111-8111-111111111111"
+        assert client.chat(
+            [{"role": "user", "content": "private prompt body"}],
+            request_kind="stage3",
+        ) == "请求内回答"
+
+    trace = trace_records(caplog)[-1]
+    assert trace["request_id"] == "11111111-1111-4111-8111-111111111111"
+    assert "private prompt body" not in caplog.text
+
+
 def test_chat_fails_over_to_second_provider_after_primary_is_down(monkeypatch):
     primary = FakeProviderClient([ConnectionError("WinError 10013")] * 3)
     backup = FakeProviderClient(["备用回答"])

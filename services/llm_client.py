@@ -252,6 +252,21 @@ def _trace_request_id(value: Optional[str]) -> str:
         return hashlib.sha256(candidate.encode("utf-8", "replace")).hexdigest()[:32]
 
 
+def _flask_request_id() -> Optional[str]:
+    """Read the trusted request-local correlation id when Flask is active."""
+
+    try:
+        from flask import g, has_request_context
+
+        if not has_request_context():
+            return None
+        value = getattr(g, "codesense_request_id", None)
+        return str(value).strip() or None if value else None
+    except (ImportError, RuntimeError):
+        # The shared client is also used by workers and standalone tests.
+        return None
+
+
 def _status_code(error: Any) -> Optional[int]:
     for candidate in (
         getattr(error, "status_code", None),
@@ -636,7 +651,7 @@ class SharedLLMClient:
         request_id: Optional[str] = None,
     ) -> Optional[str]:
         trace = _LLMTrace(
-            request_id=_trace_request_id(request_id),
+            request_id=_trace_request_id(request_id or _flask_request_id()),
             request_kind=_normalize_request_kind(request_kind),
             stream=False,
         )
@@ -736,7 +751,7 @@ class SharedLLMClient:
         request_id: Optional[str] = None,
     ):
         trace = _LLMTrace(
-            request_id=_trace_request_id(request_id),
+            request_id=_trace_request_id(request_id or _flask_request_id()),
             request_kind=_normalize_request_kind(request_kind),
             stream=True,
         )

@@ -99,7 +99,26 @@ class AppTestCase(unittest.TestCase):
         response = self.client.get('/home', follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn('管理员仪表盘'.encode('utf-8'), response.data)
-    
+
+    def test_access_log_contains_opaque_request_id(self):
+        import logging
+
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(record.getMessage())
+        access_logger = logging.getLogger('access')
+        access_logger.addHandler(handler)
+        self.app.config['ACCESS_LOG_ENABLED'] = True
+        try:
+            response = self.client.get('/healthz')
+            self.assertEqual(response.status_code, 200)
+        finally:
+            access_logger.removeHandler(handler)
+
+        self.assertTrue(records)
+        self.assertRegex(records[-1], r'request_id=[0-9a-f-]{32,36}')
+        self.assertIn('GET /healthz', records[-1])
+
     def test_admin_access_teacher_route(self):
         """测试管理员访问教师专用路由"""
         from models import Assignment

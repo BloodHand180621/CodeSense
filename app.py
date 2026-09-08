@@ -11,6 +11,7 @@ import gzip
 import re
 import threading
 import time
+import uuid
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from logging import FileHandler
 
@@ -273,6 +274,10 @@ def setup_logging(app):
     @app.before_request
     def start_request_timer():
         g.codesense_request_started = time.perf_counter()
+        # Generate correlation data inside the trusted request context.  Do
+        # not accept a caller-supplied id: access and LLM logs must remain
+        # opaque and bounded even when a client sends arbitrary headers.
+        g.codesense_request_id = str(uuid.uuid4())
     
     # 单点登录校验
     @app.before_request
@@ -315,6 +320,9 @@ def setup_logging(app):
     def log_response_info(response):
         started = getattr(g, 'codesense_request_started', None)
         duration_ms = ((time.perf_counter() - started) * 1000) if started else 0
+        request_id = getattr(g, 'codesense_request_id', None)
+        if not request_id:
+            request_id = str(uuid.uuid4())
         is_static = request.endpoint in ['static', 'favicon']
         metrics = app.extensions.get('codesense_metrics')
         if metrics:
@@ -328,7 +336,8 @@ def setup_logging(app):
         if not is_static:
             line = (
                 f'{request.remote_addr} "{request.method} {request.path}" '
-                f'{response.status_code} {duration_ms:.0f}ms'
+                f'{response.status_code} {duration_ms:.0f}ms '
+                f'request_id={request_id}'
             )
             if app.config.get('ACCESS_LOG_ENABLED'):
                 access_logger.info(line)
