@@ -149,9 +149,36 @@ a:hover {
 }
 
 /* 页面内容 */
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: -4rem;
+  z-index: 10000;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-md);
+  background: var(--dark);
+  color: var(--white);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.skip-link:focus {
+  top: 1rem;
+  color: var(--white);
+}
+
+:where(a, button, input, select, textarea):focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.55);
+  outline-offset: 3px;
+}
+
 .main-content {
   padding: var(--spacing-xl) 0;
   min-height: calc(100vh - 180px);
+}
+
+.main-content:focus {
+  outline: none;
 }
 
 .page-header {

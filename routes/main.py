@@ -5,7 +5,7 @@ import datetime
 import csv
 import io
 import json  # 添加json模块导入
-from flask import Blueprint, render_template, redirect, url_for, flash, session, request, jsonify, Response, current_app
+from flask import Blueprint, render_template, redirect, url_for, flash, session, request, jsonify, Response, current_app, abort, g
 from flask_login import login_required, current_user
 from sqlalchemy import func
 from sqlalchemy.orm import joinedload
@@ -21,6 +21,14 @@ from models import (
 )
 from services.teacher_analytics import build_teacher_dashboard_data
 from services.demo_database import current_demo_run_id
+from services.feedback import (
+    FEEDBACK_CATEGORIES,
+    FeedbackValidationError,
+    create_feedback_record,
+    find_feedback,
+    list_feedback,
+    save_feedback,
+)
 from utils.auth import admin_required
 from utils.maturity_calculator import calculate_maturity_components
 from utils.sse import sse_event, sse_response
@@ -961,40 +969,136 @@ def help():
     """使用帮助页面"""
     return render_template('help.html')
 
+
+def _feedback_form_data():
+    """Return safe values for re-rendering the feedback form."""
+
+    data = {
+        'category': request.form.get('category', 'experience'),
+        'subject': request.form.get('subject', ''),
+        'message': request.form.get('message', ''),
+        'reproduction_steps': request.form.get('reproduction_steps', ''),
+        'page_context': request.form.get(
+            'page_context',
+            request.args.get('from_page') or request.args.get('from') or '/feedback',
+        ),
+        'contact_email': request.form.get(
+            'contact_email',
+            getattr(current_user, 'email', '') if current_user.is_authenticated else '',
+        ),
+    }
+    return data
+
+
+def _feedback_request_context():
+    return {
+        'request_id': getattr(g, 'codesense_request_id', None),
+        'endpoint': request.endpoint,
+        'method': request.method,
+    }
+
+
+def _feedback_user_id():
+    """Return a database-backed id, or None for anonymous visitors."""
+
+    if not current_user.is_authenticated:
+        return None
+    return getattr(current_user, 'student_id', None) or None
+
+
+def _save_feedback(data):
+    record = create_feedback_record(
+        data,
+        request_context=_feedback_request_context(),
+    )
+    save_feedback(record, user_id=_feedback_user_id())
+    return record
+
+
+@main.route('/feedback', methods=['GET', 'POST'])
+def feedback():
+    """Feedback intake with an opaque receipt and initial status."""
+
+    if request.method == 'POST':
+        try:
+            record = _save_feedback(request.form)
+        except FeedbackValidationError as exc:
+            return render_template(
+                'feedback.html',
+                categories=FEEDBACK_CATEGORIES,
+                form_data=_feedback_form_data(),
+                errors=exc.errors,
+            )
+        except Exception:
+            db.session.rollback()
+            current_app.logger.exception(
+                '反馈提交失败 request_id=%s',
+                getattr(g, 'codesense_request_id', None),
+            )
+            flash('反馈暂时未能提交，请稍后重试。', 'danger')
+            return render_template(
+                'feedback.html',
+                categories=FEEDBACK_CATEGORIES,
+                form_data=_feedback_form_data(),
+                errors={},
+            ), 503
+
+        return redirect(url_for('main.feedback_receipt', feedback_id=record['feedback_id']))
+
+    return render_template(
+        'feedback.html',
+        categories=FEEDBACK_CATEGORIES,
+        form_data=_feedback_form_data(),
+        errors={},
+    )
+
+
+@main.route('/feedback/receipt/<feedback_id>')
+def feedback_receipt(feedback_id):
+    """Display only the non-sensitive receipt state for one feedback item."""
+
+    record = find_feedback(feedback_id)
+    if record is None:
+        abort(404)
+    return render_template('feedback_receipt.html', record=record)
+
+
+@main.route('/admin/feedback')
+@login_required
+@admin_required
+def admin_feedback():
+    """Review the structured feedback intake records as an administrator."""
+
+    return render_template('admin_feedback.html', feedback_records=list_feedback())
+
+
 @main.route('/contact', methods=['GET', 'POST'])
 def contact():
     """联系我们页面"""
     if request.method == 'POST':
         try:
-            # 获取表单数据
-            name = request.form.get('name')
-            email = request.form.get('email')
-            subject = request.form.get('subject')
-            message = request.form.get('message')
-            
-            # 验证必要的字段
-            if not all([name, email, subject, message]):
-                flash('请填写所有必填字段', 'warning')
-                return render_template('contact.html')
-                
-            # 记录反馈信息到系统日志
-            log_entry = SystemLog(
-                user_id=session.get('student_id', '游客'),
-                action='提交反馈',
-                details=f'主题: {subject}, 联系人: {name}, 邮箱: {email}'
+            # 保留旧 POST 合约，将历史表单转入新的反馈记录格式。
+            legacy_data = {
+                'category': request.form.get('category', 'other'),
+                'subject': request.form.get('subject', ''),
+                'message': request.form.get('message', ''),
+                'reproduction_steps': request.form.get('reproduction_steps', ''),
+                'page_context': request.form.get('page_context', '/contact'),
+                'contact_email': request.form.get('email', ''),
+            }
+            record = _save_feedback(legacy_data)
+            return redirect(url_for('main.feedback_receipt', feedback_id=record['feedback_id']))
+        except FeedbackValidationError:
+            flash('请填写有效的主题、邮箱和留言内容。', 'warning')
+            return redirect(url_for('main.feedback', from_page='/contact'))
+        except Exception:
+            current_app.logger.exception(
+                '旧版联系表单提交失败 request_id=%s',
+                getattr(g, 'codesense_request_id', None),
             )
-            db.session.add(log_entry)
-            db.session.commit()
-            
-            # 在实际应用中，还可以发送电子邮件通知管理员
-            # send_feedback_email(name, email, subject, message)
-            
-            flash('感谢您的反馈！我们会尽快回复您。', 'success')
-            return redirect(url_for('main.contact'))
-            
-        except Exception as e:
-            flash(f'提交失败，请稍后再试。错误: {str(e)}', 'danger')
             db.session.rollback()
+            flash('提交失败，请稍后再试。', 'danger')
+            return redirect(url_for('main.contact'))
             
     return render_template('contact.html')
 
