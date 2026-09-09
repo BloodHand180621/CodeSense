@@ -101,17 +101,34 @@
 - integration worktree：`E:\CodeSense\release-integration-20260909`
 - integration parent：`329c56bf503af5fc941a945b6f79828f4f3d1138`
 - cherry-pick commit：`f5210e768eabe8be03875e6b0f009ed66a6ffeae`
+- push 前功能与报告提交：`5c6ccb646a6d31fcc8ca304ab2296c88a14d9111`
 - full pytest：`424 passed`，`204.92s`
 - compileall：exit `0`
 - `git diff --check`：exit `0`
-- integration worktree：clean，only one commit ahead of `origin/main`
+- integration worktree：clean；push 前相对 `origin/main` 为两个快进提交
 
-集成没有冲突，也没有发现数据库 schema、依赖锁定、路由导入、模板渲染或角色保护回归。候选现在满足 push 与线上更新门禁；下一步仍必须记录实际 push、`update.sh` 和部署后只读探针结果。
+集成没有冲突，也没有发现数据库 schema、依赖锁定、路由导入、模板渲染或角色保护回归。
+
+## Post-deploy verification
+
+部署时间约 `2026-09-09 10:50:46 +08:00`，执行的是服务器已有 `/var/www/codesense/update.sh`，Workbench 命令 exit `0`：
+
+- 远端 push：`329c56b..5c6ccb6`，非强制快进到 `main`。
+- `update.sh`：Git fast-forward、依赖检查、systemd unit 安装/重载和主服务重启成功；没有运行数据库迁移，也没有提交生产反馈。
+- 服务器 HEAD 与 `origin/main` 均为 `5c6ccb646a6d31fcc8ca304ab2296c88a14d9111`。
+- `codesense`、ability worker、submission worker、nginx、redis、mysqld 均 `active`；主服务与两个 worker `NRestarts=0`。
+- `nginx -t` 成功；HTTPS `healthz=200`、`readyz=200`、`login=200`、`contact=200`、`about=200`、`feedback=200`。
+- 未授权 `/admin/feedback=302`，follow-up header 确认重定向到 `/login?next=%2Fadmin%2Ffeedback`；无效回执返回 `404`。
+- 反馈页包含“提交一条反馈”，旧联系页包含“前往反馈中心”；没有对生产执行 POST canary。
+- 服务器 dirty count 仍为 `3`，与部署前一致；未读取或记录未跟踪条目名称/内容。
+
+第一次聚合验证命令因把“登录”正文断言用于 302 响应而返回命令级 exit `1`，未改变服务器状态；随后用 redirect header 复核并通过，业务状态保持正常。
 
 ## Current decision
 
-- release：`ready_for_release`
-- push remote main：`approved_by_automation`
-- execute `update.sh`：`approved_by_automation`
-- rollback：`not_applicable`（候选尚未进入远端/服务器）
-- stop reason：`awaiting_online_release`
+- release：`published`
+- push remote main：`done`（`5c6ccb646a6d31fcc8ca304ab2296c88a14d9111`）
+- execute `update.sh`：`done`
+- rollback：`not_used`；如后续回归失败，前一已验证服务器版本为 `1b4d51e48abca55122a27809d16419c38bd1bd8e`
+- stop reason：`completed_release_product_slice`
+- report finalized：`2026-09-09 11:02:52 +08:00`
