@@ -96,10 +96,22 @@
 
 失败时停止继续重启；若已经更新且回归失败，使用前一已验证 commit 做人工批准的可逆恢复或 `git revert`，不删除反馈数据。
 
+## Integration gate result
+
+- integration worktree：`E:\CodeSense\release-integration-20260909`
+- integration parent：`329c56bf503af5fc941a945b6f79828f4f3d1138`
+- cherry-pick commit：`f5210e768eabe8be03875e6b0f009ed66a6ffeae`
+- full pytest：`424 passed`，`204.92s`
+- compileall：exit `0`
+- `git diff --check`：exit `0`
+- integration worktree：clean，only one commit ahead of `origin/main`
+
+集成没有冲突，也没有发现数据库 schema、依赖锁定、路由导入、模板渲染或角色保护回归。候选现在满足 push 与线上更新门禁；下一步仍必须记录实际 push、`update.sh` 和部署后只读探针结果。
+
 ## Current decision
 
-- release：`pending_integration`
-- push remote main：`pending`
-- execute `update.sh`：`pending`
+- release：`ready_for_release`
+- push remote main：`approved_by_automation`
+- execute `update.sh`：`approved_by_automation`
 - rollback：`not_applicable`（候选尚未进入远端/服务器）
-- stop reason：`awaiting_clean_integration_gate`
+- stop reason：`awaiting_online_release`
