@@ -327,11 +327,15 @@ def submit_code():
             )
             
         except Exception as e:
-            print(f"评估代码时出错: {e}")
-            print(traceback.format_exc())
-            
+            # 清理评估过程中可能留下的失败事务，再持久化可恢复的失败状态。
+            db.session.rollback()
             submission.status = 'failed'
+            submission.feedback = f'代码评估失败: {str(e)}'
             db.session.commit()
+            current_app.logger.exception(
+                "代码评估失败，提交已标记为 failed (submission_id=%s)",
+                submission.id,
+            )
             
             return error_response(f"代码评估失败: {str(e)}", 500)
             
